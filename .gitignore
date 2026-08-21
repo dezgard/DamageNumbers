@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+backups/
+builds/
+releases/
+development_private/
+*.semod
+*.exe
+*.log
+*.key
+*.pem
+
