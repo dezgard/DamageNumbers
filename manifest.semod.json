@@ -3,13 +3,14 @@
   "compatibility": {
     "game_versions": [
       "0.4.62",
-      "0.4.63"
+      "0.4.63",
+      "0.4.66"
     ],
     "mode": "game-version"
   },
   "conflicts": [],
   "dependencies": [],
-  "description": "Floating combat damage figures anchored to the ship or asteroid that was hit.",
+  "description": "Floating combat damage figures and a personal dealt/received damage report.",
   "entrypoint": "star_empire_damage_numbers:register",
   "files": [
     "mod/star_empire_damage_numbers/README.md",
@@ -22,6 +23,7 @@
   "mod_id": "star_empire_damage_numbers",
   "name": "Star Empire Damage Numbers",
   "permissions": [
+    "ui.input",
     "ui.render"
   ],
   "schema": 1,
@@ -30,5 +32,5 @@
     "repository": "dezgard/DamageNumbers",
     "type": "github-release"
   },
-  "version": "0.1"
+  "version": "0.2"
 }
