@@ -1,56 +1,36 @@
 # Star Empire Damage Numbers
 
-Damage Numbers adds clear floating combat figures to Star Empire. Damage dealt
-to another target appears as a large red number, while hits against your own
-ship use a smaller pale number so the two are easy to tell apart.
+Damage Numbers makes combat easier to follow. It shows a floating damage value
+over each ship or asteroid that is hit and keeps a report of the damage you deal
+and receive.
 
-## Features
+## What it shows
 
-- Shows damage over the ship or asteroid that was actually hit.
-- Limits the report to damage dealt by you and damage received by you; nearby
-  fights between other players or AI are ignored.
-- Supports normal ship combat and asteroid damage.
-- Keeps the display brief and limited so combat does not become cluttered.
-- Leaves each number at the impact point while it rises and fades.
-- Adds a movable and resizable Damage Report with separate damage dealt and
-  received totals.
-- Keeps the complete damage history for the current game session instead of
-  discarding older entries after a fixed number of hits.
-- Organizes target names and blocked hits into **ALL**, **DEALT**, and
-  **RECEIVED** feed tabs.
-- Shows the full damage type on each feed row: **Kinetic**, **Laser**,
-  **Thermal**, **Biogenic**, **Mining**, **Energy**, or **Unknown**.
-- Labels your own ship as **Player** and uses the AI or player name supplied by
-  the game when that identity is available. Received rows show the attacker's
-  name directly without adding `-> Player` after it.
+- Floating damage numbers over the target that was hit.
+- A report covering your combat only, without nearby fights mixed in.
+- Separate **All**, **Dealt**, and **Received** tabs with totals and hit counts.
+- Target names and full damage types when Star Empire provides them.
+- Your complete damage history for the current game session.
+- A movable and resizable window with mouse-wheel and scrollbar controls.
 
 ## Using the mod
 
-1. Install the `.semod` with Star Empire Mod Manager.
-2. Enable **Star Empire Damage Numbers**.
-3. Start the game and enter combat. The Damage Report opens near the top-right
-   of the screen.
+Install and enable the `.semod` with Star Empire Mod Manager, then enter combat.
+The Damage Report opens near the top-right of the screen.
 
-Drag the title bar to move the report. Drag any edge or corner to resize it;
-taller windows automatically show more history rows. Use the mouse wheel over
-the feed, drag the scrollbar thumb, or click the scrollbar track to review older
-entries. Each tab remembers its own scroll position, and new hits do not move an
-older view out from under you. **CLEAR** resets the current session history and
-totals without affecting floating numbers already on screen. Close the report
-with **x** and press **F8** to show or hide it at any time.
+Drag the title bar to move it and drag an edge or corner to resize it. Scroll
+over the damage list or drag the scrollbar to view older hits. **CLEAR** resets
+the current history and totals. Press **F8** to show or hide the report.
 
 Disable or uninstall the mod through the Manager to return to the normal combat
 display.
 
-## Safety and compatibility
+## Notes
 
-The mod only observes the game's existing hit notifications and draws a visual
-overlay. It does not change damage, shields, weapons, targeting, loot, or any
-server-side data. Events that cannot be safely linked to you are left out of
-the report instead of being presented as your damage.
+This is a visual mod. It does not change damage, shields, weapons, targeting,
+loot, or server data.
 
-The game currently supplies a damage type for each hit, but does not identify
-whether that hit was direct damage or a damage-over-time tick. The report does
-not guess that Thermal damage is fire or label uncertain hits as DOT damage.
+Star Empire provides the damage type, but does not say whether a hit is direct
+damage or a damage-over-time tick, so the report does not guess.
 
 Tested with Star Empire 0.4.62, 0.4.63, and 0.4.66 using Mod Loader API 1.
