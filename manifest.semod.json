@@ -10,7 +10,7 @@
   },
   "conflicts": [],
   "dependencies": [],
-  "description": "Floating combat damage figures and a personal dealt/received damage report.",
+  "description": "Shows floating damage numbers and keeps a personal combat report.",
   "entrypoint": "star_empire_damage_numbers:register",
   "files": [
     "mod/star_empire_damage_numbers/README.md",
