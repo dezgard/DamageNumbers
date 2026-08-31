@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from typing import Any
 
 
@@ -57,6 +58,24 @@ class _DamageState:
         self.received_total = 0.0
         self.dealt_hits = 0
         self.received_hits = 0
+        self.encounter_stats = {
+            "dealt": self._empty_direction_stats(),
+            "received": self._empty_direction_stats(),
+        }
+        self.rolling_hits = deque()
+        self.rolling_totals = {"dealt": 0.0, "received": 0.0}
+        self.encounter_started_at = None
+        self.encounter_last_hit_at = None
+        self.encounter_quiet_seconds = 10.0
+        self.rolling_seconds = 10.0
+        self.encounter_energy_used = 0.0
+        self.energy_previous = None
+        self.energy_previous_at = None
+        self.energy_previous_max = None
+        self.energy_observation_token = None
+        self.energy_recent_spend = deque()
+        self.energy_prehit_seconds = 2.0
+        self.energy_sample_max_gap = 2.0
         self.window_open = True
         self.window_x = None
         self.window_y = 82
@@ -77,6 +96,39 @@ class _DamageState:
         self.resize_margin = 7
         self.fire_intents = []
         self.fire_intent_grace = 2.0
+        self.weapon_tracks = {}
+        self.weapon_target_intents = []
+        self.weapon_track_grace = 0.75
+
+    @staticmethod
+    def _empty_direction_stats() -> dict:
+        return {
+            "total": 0.0,
+            "hits": 0,
+            "blocked": 0,
+            "maximum": 0.0,
+            "types": {},
+            "targets": {},
+        }
+
+    def _reset_encounter_unlocked(self, started_at: float | None) -> None:
+        self.encounter_stats = {
+            "dealt": self._empty_direction_stats(),
+            "received": self._empty_direction_stats(),
+        }
+        self.rolling_hits.clear()
+        self.rolling_totals = {"dealt": 0.0, "received": 0.0}
+        self.encounter_started_at = started_at
+        self.encounter_last_hit_at = started_at
+        if started_at is None:
+            self.encounter_energy_used = 0.0
+        else:
+            cutoff = float(started_at) - self.energy_prehit_seconds
+            while (self.energy_recent_spend
+                   and self.energy_recent_spend[0][0] < cutoff):
+                self.energy_recent_spend.popleft()
+            self.encounter_energy_used = sum(
+                amount for _, amount in self.energy_recent_spend)
 
     @staticmethod
     def _same_id(left: Any, right: Any) -> bool:
@@ -175,6 +227,72 @@ class _DamageState:
         value = str(hit.get("damage_type", "")).strip().casefold()
         return _DAMAGE_TYPE_LABELS.get(value, "Unknown")
 
+    def _observe_energy(self, host: Any) -> None:
+        """Track ship-wide energy spent between authoritative entity updates."""
+        finder = getattr(host, "_find_my_entity", None)
+        try:
+            row = finder() if callable(finder) else None
+            row = dict(row) if isinstance(row, dict) else None
+        except Exception:
+            row = None
+        energy = self._number(row, "energy")
+        if energy is None:
+            return
+        maximum = self._number(row, "max_energy")
+        regen = self._number(row, "effective_energy_regen")
+        if regen is None:
+            regen = self._number(row, "energy_output")
+        regen = max(0.0, 0.0 if regen is None else regen)
+        received_at = self._number(row, "recv_time")
+        observed_at = time.monotonic()
+        sample_at = observed_at if received_at is None else received_at
+        token = (received_at, energy, maximum, regen)
+
+        with self.lock:
+            if token == self.energy_observation_token:
+                return
+            self.energy_observation_token = token
+            previous = self.energy_previous
+            previous_at = self.energy_previous_at
+            previous_max = self.energy_previous_max
+            self.energy_previous = energy
+            self.energy_previous_at = sample_at
+            self.energy_previous_max = maximum
+
+            valid_interval = (
+                previous is not None
+                and previous_at is not None
+                and sample_at > previous_at
+                and sample_at - previous_at <= self.energy_sample_max_gap
+                and (previous_max is None or maximum is None
+                     or math.isclose(previous_max, maximum, rel_tol=1e-6,
+                                     abs_tol=0.05))
+            )
+            if not valid_interval:
+                return
+
+            tolerance = max(0.05, (maximum or previous_max or 0.0) * 1e-6)
+            both_full = (
+                maximum is not None
+                and previous >= maximum - tolerance
+                and energy >= maximum - tolerance
+            )
+            spent = 0.0 if both_full else max(
+                0.0, previous + regen * (sample_at - previous_at) - energy)
+            if spent <= tolerance:
+                return
+
+            cutoff = observed_at - self.energy_prehit_seconds
+            while (self.energy_recent_spend
+                   and self.energy_recent_spend[0][0] < cutoff):
+                self.energy_recent_spend.popleft()
+            self.energy_recent_spend.append((observed_at, spent))
+            last_hit = self.encounter_last_hit_at
+            if (last_hit is not None
+                    and observed_at >= last_hit
+                    and observed_at - last_hit <= self.encounter_quiet_seconds):
+                self.encounter_energy_used += spent
+
     def _local_player_id(self, host: Any) -> Any:
         player_id = getattr(host, "_local_player_id", None)
         if player_id is not None:
@@ -260,6 +378,242 @@ class _DamageState:
                 for known_target, _expiry in self.fire_intents
             )
 
+    @staticmethod
+    def _point_segment_distance(
+            px: float, py: float, ax: float, ay: float,
+            bx: float, by: float) -> float:
+        dx = bx - ax
+        dy = by - ay
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0.000001:
+            return math.hypot(px - ax, py - ay)
+        along = ((px - ax) * dx + (py - ay) * dy) / length_sq
+        along = max(0.0, min(1.0, along))
+        nearest_x = ax + dx * along
+        nearest_y = ay + dy * along
+        return math.hypot(px - nearest_x, py - nearest_y)
+
+    @staticmethod
+    def _target_hint(row: dict) -> Any:
+        for field in (
+                "target_id", "target_player_id", "target_npc_id",
+                "target_entity_id", "asteroid_target_id"):
+            value = row.get(field)
+            if value is not None:
+                return value
+        return None
+
+    def _local_owner_tokens(
+            self, local_id: Any,
+            entity_rows: list[tuple[Any, Any]]) -> set[str]:
+        tokens = self._id_tokens(local_id)
+        for entity_key, row in entity_rows:
+            if not isinstance(row, dict):
+                continue
+            if not any(
+                    self._same_id(row.get(field), local_id)
+                    for field in (
+                        "owner_id", "player_id", "drone_owner_id",
+                        "rc_owner_id", "source_owner_id")):
+                continue
+            tokens.update(self._id_tokens(entity_key))
+            for field in ("id", "entity_id", "npc_id", "player_id"):
+                tokens.update(self._id_tokens(row.get(field)))
+        return tokens
+
+    def _observe_owned_projectiles(self, host: Any) -> None:
+        now = time.monotonic()
+        try:
+            with host._lock:
+                streams = (
+                    ("player", dict(getattr(host, "_proj_interp", {}))),
+                    ("arena", dict(getattr(host, "_ai_proj_interp", {}))),
+                )
+                entity_rows = list(
+                    getattr(host, "_remote_entities", {}).items())
+                entity_rows += list(
+                    getattr(host, "_npc_entities", {}).items())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            streams = ()
+            entity_rows = []
+
+        local_id = self._local_player_id(host)
+        owner_tokens = self._local_owner_tokens(local_id, entity_rows)
+        observed = []
+        for stream_name, projectiles in streams:
+            for projectile_id, row in projectiles.items():
+                if not isinstance(row, dict):
+                    continue
+                owner_id = self._attacker_id(row)
+                if not self._id_tokens(owner_id).intersection(owner_tokens):
+                    continue
+                try:
+                    x = float(row["x"])
+                    y = float(row["y"])
+                    vx = float(row.get("vx", 0.0))
+                    vy = float(row.get("vy", 0.0))
+                    radius = max(0.0, float(row.get("radius", 3.0)))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                observed.append((
+                    stream_name + ":" + str(projectile_id),
+                    x, y, vx, vy, radius, owner_id,
+                    self._target_hint(row),
+                ))
+
+        with self.lock:
+            for (track_id, x, y, vx, vy, radius, owner_id,
+                 target_hint) in observed:
+                previous = self.weapon_tracks.get(track_id)
+                if previous is None:
+                    previous_x, previous_y = x, y
+                elif (x != previous["x"] or y != previous["y"]):
+                    previous_x, previous_y = previous["x"], previous["y"]
+                else:
+                    previous_x = previous["previous_x"]
+                    previous_y = previous["previous_y"]
+                self.weapon_tracks[track_id] = {
+                    "x": x,
+                    "y": y,
+                    "previous_x": previous_x,
+                    "previous_y": previous_y,
+                    "vx": vx,
+                    "vy": vy,
+                    "radius": radius,
+                    "owner_id": owner_id,
+                    "target_hint": target_hint,
+                    "last_seen": now,
+                }
+            self.weapon_tracks = {
+                track_id: track
+                for track_id, track in self.weapon_tracks.items()
+                if now - track["last_seen"] <= self.weapon_track_grace
+            }
+
+    def _target_geometry(
+            self, host: Any,
+            target_id: Any) -> tuple[float, float, float] | None:
+        row = self._entity(host, target_id)
+        position = self._world_position(host, target_id)
+        default_radius = 12.0
+        if position is None:
+            row = self._asteroid(host, target_id)
+            position = self._asteroid_position(host, target_id)
+            default_radius = 20.0
+        if position is None:
+            return None
+        radius = self._number(row, "radius")
+        return position[0], position[1], max(
+            1.0, default_radius if radius is None else radius)
+
+    @staticmethod
+    def _beam_entries(host: Any) -> tuple[tuple[dict, float], ...]:
+        entries = []
+        for field, lock_field in (
+                ("_beams", "_beams_lock"),
+                ("_turret_beams", "_turret_beams_lock"),
+                ("_station_beams", "_station_beams_lock")):
+            lock = getattr(host, lock_field, None)
+            try:
+                if lock is None:
+                    current = list(getattr(host, field, ()))
+                else:
+                    with lock:
+                        current = list(getattr(host, field, ()))
+            except (AttributeError, RuntimeError, TypeError):
+                continue
+            for entry in current:
+                if (isinstance(entry, (tuple, list)) and len(entry) >= 2
+                        and isinstance(entry[0], dict)):
+                    beam, born_at = entry[0], entry[1]
+                elif isinstance(entry, dict):
+                    beam, born_at = entry, time.monotonic()
+                else:
+                    continue
+                try:
+                    entries.append((beam, float(born_at)))
+                except (TypeError, ValueError):
+                    continue
+        return tuple(entries)
+
+    def _recent_owned_beam_at(self, host: Any, target_id: Any) -> bool:
+        geometry = self._target_geometry(host, target_id)
+        if geometry is None:
+            return False
+        target_x, target_y, target_radius = geometry
+        now = time.monotonic()
+        for beam, born_at in self._beam_entries(host):
+            age = now - born_at
+            if age < -0.1 or age > self.weapon_track_grace:
+                continue
+            owner_id = self._attacker_id(beam)
+            if not self._owned_by_player(host, owner_id):
+                continue
+            target_hint = self._target_hint(beam)
+            if self._matching_id(target_hint, target_id):
+                return True
+            try:
+                end_x = float(beam["ex"])
+                end_y = float(beam["ey"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            padding = max(14.0, target_radius * 0.35)
+            if math.hypot(end_x - target_x, end_y - target_y) <= (
+                    target_radius + padding):
+                return True
+        return False
+
+    def _recent_owned_projectile_at(self, host: Any, target_id: Any) -> bool:
+        self._observe_owned_projectiles(host)
+        geometry = self._target_geometry(host, target_id)
+        if geometry is None:
+            return False
+        target_x, target_y, target_radius = geometry
+        now = time.monotonic()
+        with self.lock:
+            tracks = tuple(self.weapon_tracks.values())
+        for track in tracks:
+            age = now - track["last_seen"]
+            if age < -0.1 or age > self.weapon_track_grace:
+                continue
+            if self._matching_id(track["target_hint"], target_id):
+                return True
+            prediction = min(0.25, max(0.08, age))
+            end_x = track["x"] + track["vx"] * prediction
+            end_y = track["y"] + track["vy"] * prediction
+            distance = self._point_segment_distance(
+                target_x, target_y,
+                track["previous_x"], track["previous_y"],
+                end_x, end_y,
+            )
+            tolerance = target_radius + track["radius"] + 18.0
+            if distance <= tolerance:
+                return True
+        return False
+
+    def _recent_owned_weapon_at(self, host: Any, target_id: Any) -> bool:
+        now = time.monotonic()
+        with self.lock:
+            self.weapon_target_intents = [
+                (known_target, expiry)
+                for known_target, expiry in self.weapon_target_intents
+                if expiry >= now
+            ]
+            if any(
+                    self._matching_id(known_target, target_id)
+                    for known_target, _expiry in self.weapon_target_intents):
+                return True
+        matched = (
+            self._recent_owned_beam_at(host, target_id)
+            or self._recent_owned_projectile_at(host, target_id)
+        )
+        if matched:
+            with self.lock:
+                self.weapon_target_intents.append((
+                    target_id, now + self.weapon_track_grace))
+                self.weapon_target_intents = self.weapon_target_intents[-8:]
+        return matched
+
     def _owned_by_player(self, host: Any, entity_id: Any) -> bool:
         local_id = self._local_player_id(host)
         if self._same_id(entity_id, local_id):
@@ -284,6 +638,8 @@ class _DamageState:
         if self._owned_by_player(host, attacker_id):
             return "dealt", attacker_id
         if self._recent_local_fire_at(target_id):
+            return "dealt", self._local_player_id(host)
+        if self._recent_owned_weapon_at(host, target_id):
             return "dealt", self._local_player_id(host)
         return None
 
@@ -352,8 +708,9 @@ class _DamageState:
         display_label = target_label
         if local_hit and attacker_label and attacker_label != "Player":
             display_label = attacker_label
+        now = time.monotonic()
         entry = {
-            "when": time.monotonic(),
+            "when": now,
             "direction": direction,
             "target": display_label,
             "attacker": attacker_label,
@@ -362,6 +719,25 @@ class _DamageState:
             "blocked": amount == 0.0,
         }
         with self.lock:
+            if (self.encounter_last_hit_at is None
+                    or now < self.encounter_last_hit_at
+                    or now - self.encounter_last_hit_at
+                    > self.encounter_quiet_seconds):
+                self._reset_encounter_unlocked(now)
+            self.encounter_last_hit_at = now
+            encounter = self.encounter_stats[direction]
+            encounter["total"] += amount
+            encounter["hits"] += 1
+            encounter["blocked"] += int(amount == 0.0)
+            encounter["maximum"] = max(encounter["maximum"], amount)
+            for totals, key in (
+                    (encounter["types"], damage_type),
+                    (encounter["targets"], display_label)):
+                bucket = totals.setdefault(key, {"amount": 0.0, "hits": 0})
+                bucket["amount"] += amount
+                bucket["hits"] += 1
+            self.rolling_hits.append((now, direction, amount))
+            self.rolling_totals[direction] += amount
             if local_hit:
                 self.received_total += amount
                 self.received_hits += 1
@@ -385,6 +761,12 @@ class _DamageState:
             self.received_total = 0.0
             self.dealt_hits = 0
             self.received_hits = 0
+            self._reset_encounter_unlocked(None)
+            self.energy_recent_spend.clear()
+            self.energy_previous = None
+            self.energy_previous_at = None
+            self.energy_previous_max = None
+            self.energy_observation_token = None
 
     def window_snapshot(self) -> dict:
         with self.lock:
@@ -419,6 +801,87 @@ class _DamageState:
                 "received_total": self.received_total,
                 "dealt_hits": self.dealt_hits,
                 "received_hits": self.received_hits,
+            }
+
+    @staticmethod
+    def _direction_stats(
+            source: dict, duration: float, rolling_total: float,
+            rolling_duration: float) -> dict:
+        total = float(source["total"])
+        hits = int(source["hits"])
+        def ranked(source: dict[str, dict[str, float | int]]) -> tuple[dict, ...]:
+            result = []
+            for label, values in source.items():
+                amount = float(values["amount"])
+                result.append({
+                    "label": label,
+                    "amount": amount,
+                    "hits": int(values["hits"]),
+                    "percent": (amount / total * 100.0) if total > 0.0 else 0.0,
+                })
+            result.sort(key=lambda value: (-value["amount"], value["label"]))
+            return tuple(result)
+
+        return {
+            "total": total,
+            "hits": hits,
+            "blocked": int(source["blocked"]),
+            "average": total / hits if hits else 0.0,
+            "maximum": float(source["maximum"]),
+            "dps": total / max(1.0, duration) if hits else 0.0,
+            "rolling_dps": (
+                rolling_total / max(1.0, rolling_duration)
+                if hits else 0.0
+            ),
+            "hits_per_second": hits / max(1.0, duration) if hits else 0.0,
+            "types": ranked(source["types"]),
+            "targets": ranked(source["targets"]),
+        }
+
+    def combat_stats_snapshot(self, now: float | None = None) -> dict:
+        current = time.monotonic() if now is None else float(now)
+        with self.lock:
+            started = self.encounter_started_at
+            last = self.encounter_last_hit_at
+            quiet = self.encounter_quiet_seconds
+            rolling = self.rolling_seconds
+            if started is None or last is None:
+                status = "idle"
+                duration = 0.0
+                rolling_duration = 0.0
+            else:
+                current = max(current, float(last))
+                active = current - float(last) <= quiet
+                status = "active" if active else "complete"
+                duration = max(0.0, float(last) - float(started))
+                rolling_duration = min(
+                    rolling, max(0.0, current - float(started)))
+
+            cutoff = current - rolling
+            while (self.rolling_hits
+                   and float(self.rolling_hits[0][0]) < cutoff):
+                _, direction, amount = self.rolling_hits.popleft()
+                self.rolling_totals[direction] = max(
+                    0.0, self.rolling_totals[direction] - amount)
+            energy_used = max(0.0, float(self.encounter_energy_used))
+            dealt_total = float(self.encounter_stats["dealt"]["total"])
+            dpe_available = energy_used > 1e-6
+            return {
+                "status": status,
+                "duration": duration,
+                "quiet_seconds": quiet,
+                "rolling_seconds": rolling,
+                "dealt": self._direction_stats(
+                    self.encounter_stats["dealt"], duration,
+                    self.rolling_totals["dealt"], rolling_duration),
+                "received": self._direction_stats(
+                    self.encounter_stats["received"], duration,
+                    self.rolling_totals["received"], rolling_duration),
+                "energy_used": energy_used,
+                "dpe": dealt_total / energy_used if dpe_available else 0.0,
+                "dpe_available": dpe_available,
+                "dpe_reason": (
+                    "" if dpe_available else "No encounter energy use recorded"),
             }
 
     def feed_view(self, row_limit: int) -> dict:
@@ -644,7 +1107,9 @@ class _DamageState:
                 # becomes the next valid baseline.
                 if previous is None or value > previous:
                     self.pools[key] = value
+        self._observe_owned_projectiles(host)
         self._observe_local_fire(host)
+        self._observe_energy(host)
 
     def _draw_floaters(self, host: Any, surface: Any) -> None:
         now = time.monotonic()
@@ -775,6 +1240,142 @@ class _DamageState:
             x: int, y: int) -> None:
         panel.blit(font.render(str(text), True, colour), (x, y))
 
+    @staticmethod
+    def _format_metric(value: float) -> str:
+        amount = max(0.0, float(value))
+        for threshold, suffix in (
+                (1_000_000_000.0, "B"),
+                (1_000_000.0, "M"),
+                (1_000.0, "K")):
+            if amount >= threshold:
+                scaled = amount / threshold
+                return f"{scaled:.1f}{suffix}" if scaled < 100.0 else f"{scaled:.0f}{suffix}"
+        return f"{amount:.1f}" if 0.0 < amount < 100.0 else f"{amount:.0f}"
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        whole = max(0, int(seconds))
+        hours, remainder = divmod(whole, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _draw_stats_panel(
+            self, panel: Any, pygame: Any, width: int, height: int,
+            body_font: Any, value_font: Any, small_font: Any,
+            stats: dict) -> None:
+        status = str(stats["status"]).upper()
+        status_colour = {
+            "ACTIVE": (104, 222, 137),
+            "COMPLETE": (232, 190, 85),
+            "IDLE": (127, 141, 154),
+        }.get(status, (127, 141, 154))
+        self._blit_text(
+            panel, small_font, "ENCOUNTER", (140, 154, 168), 10, 73)
+        self._blit_text(panel, small_font, status, status_colour, 75, 73)
+        self._blit_text(
+            panel, small_font, self._format_duration(stats["duration"]),
+            (218, 226, 233), width - 48, 73)
+
+        card_width = (width - 30) // 2
+        for card_x, label, key, colour in (
+                (10, "DEALT", "dealt", (255, 104, 88)),
+                (20 + card_width, "RECEIVED", "received", (192, 214, 232))):
+            values = stats[key]
+            pygame.draw.rect(panel, (14, 21, 29), (card_x, 91, card_width, 84))
+            pygame.draw.rect(panel, (42, 55, 68), (card_x, 91, card_width, 84), 1)
+            self._blit_text(panel, small_font, label, colour, card_x + 7, 96)
+            metric = "DPS" if key == "dealt" else "DTPS"
+            self._blit_text(
+                panel, value_font,
+                f"{metric} {self._format_metric(values['dps'])}",
+                (238, 241, 244), card_x + 7, 111)
+            self._blit_text(
+                panel, small_font,
+                f"10S {self._format_metric(values['rolling_dps'])}",
+                (166, 180, 193), card_x + 7, 135)
+            self._blit_text(
+                panel, small_font,
+                f"AVG {self._format_metric(values['average'])}  "
+                f"MAX {self._format_metric(values['maximum'])}",
+                (166, 180, 193), card_x + 7, 149)
+            self._blit_text(
+                panel, small_font,
+                f"H/S {values['hits_per_second']:.1f}  "
+                f"BLOCK {values['blocked']}",
+                (126, 141, 155), card_x + 7, 162)
+
+        content_bottom = height - 48
+        column_x = (10, 20 + card_width)
+        heading_y = 184
+        if heading_y <= content_bottom:
+            self._blit_text(
+                panel, small_font, "DEALT BY TYPE", (255, 104, 88),
+                column_x[0], heading_y)
+            self._blit_text(
+                panel, small_font, "RECEIVED BY TYPE", (192, 214, 232),
+                column_x[1], heading_y)
+        row_y = heading_y + 17
+        type_count = max(len(stats["dealt"]["types"]),
+                         len(stats["received"]["types"]))
+        for index in range(type_count):
+            if row_y > content_bottom:
+                break
+            for col, key in enumerate(("dealt", "received")):
+                rows = stats[key]["types"]
+                if index >= len(rows):
+                    continue
+                row = rows[index]
+                label = str(row["label"])
+                max_label = max(4, (card_width - 74) // 6)
+                if len(label) > max_label:
+                    label = label[:max(1, max_label - 3)] + "..."
+                line = (
+                    f"{label} {row['percent']:.0f}% "
+                    f"{self._format_metric(row['amount'])}"
+                )
+                colour = _DAMAGE_TYPE_COLOURS.get(
+                    str(row["label"]), _DAMAGE_TYPE_COLOURS["Unknown"])
+                self._blit_text(
+                    panel, small_font, line, colour, column_x[col], row_y)
+            row_y += 17
+
+        if row_y + 34 <= content_bottom:
+            row_y += 4
+            self._blit_text(
+                panel, small_font, "TOP TARGETS", (140, 154, 168),
+                column_x[0], row_y)
+            self._blit_text(
+                panel, small_font, "TOP ATTACKERS", (140, 154, 168),
+                column_x[1], row_y)
+            row_y += 17
+            target_count = max(len(stats["dealt"]["targets"]),
+                               len(stats["received"]["targets"]))
+            for index in range(target_count):
+                if row_y > content_bottom:
+                    break
+                for col, key in enumerate(("dealt", "received")):
+                    rows = stats[key]["targets"]
+                    if index >= len(rows):
+                        continue
+                    row = rows[index]
+                    amount_text = self._format_metric(row["amount"])
+                    max_label = max(4, (card_width - 48) // 6)
+                    label = str(row["label"])
+                    if len(label) > max_label:
+                        label = label[:max(1, max_label - 3)] + "..."
+                    self._blit_text(
+                        panel, small_font, f"{label} {amount_text}",
+                        (158, 170, 182), column_x[col], row_y)
+                row_y += 17
+
+        self._blit_text(
+            panel, small_font,
+            f"DPE {stats['dpe']:.2f} dmg/energy   "
+            f"ENERGY USED {self._format_metric(stats['energy_used'])}",
+            (138, 157, 174), 10, height - 39)
+
     def _draw_window(self, host: Any, surface: Any) -> None:
         if not self.window_open or self.pygame is None:
             self.window_rect = None
@@ -795,10 +1396,10 @@ class _DamageState:
         self.header_rect = (x, y, width, 32)
         self.close_rect = (x + width - 31, y + 5, 24, 22)
         self.clear_rect = (x + width - 86, y + 6, 46, 20)
-        tab_width = min(88, max(70, (width - 28) // 3))
+        tab_width = min(88, max(58, (width - 16) // 4))
         self.tab_rects = {
-            key: (x + 10 + index * tab_width, y + 38, tab_width - 4, 24)
-            for index, key in enumerate(("all", "dealt", "received"))
+            key: (x + 8 + index * tab_width, y + 38, tab_width - 4, 24)
+            for index, key in enumerate(("all", "dealt", "received", "stats"))
         }
 
         panel = pygame.Surface((width, height), pygame.SRCALPHA)
@@ -820,7 +1421,7 @@ class _DamageState:
         self._blit_text(panel, title_font, "x", (245, 210, 212), width - 24, 6)
 
         for key, label in (("all", "ALL"), ("dealt", "DEALT"),
-                           ("received", "RECEIVED")):
+                           ("received", "RECEIVED"), ("stats", "STATS")):
             tab_x, tab_y, tab_w, tab_h = self.tab_rects[key]
             local = (tab_x - x, tab_y - y, tab_w, tab_h)
             active = key == self.active_tab
@@ -833,91 +1434,115 @@ class _DamageState:
                 (236, 239, 242) if active else (127, 141, 154),
                 local[0] + 8, local[1] + 5)
 
-        snapshot = self.window_totals_snapshot()
-        card_width = (width - 30) // 2
-        cards = (
-            (10, "DEALT", "dealt", snapshot["dealt_total"],
-             snapshot["dealt_hits"], (255, 104, 88)),
-            (20 + card_width, "RECEIVED", "received",
-             snapshot["received_total"], snapshot["received_hits"],
-             (192, 214, 232)),
-        )
-        for card_x, label, key, total, hits, colour in cards:
-            selected = self.active_tab in ("all", key)
-            fill = (14, 21, 29) if selected else (10, 15, 21)
-            border = colour if self.active_tab == key else (42, 55, 68)
-            pygame.draw.rect(panel, fill, (card_x, 70, card_width, 61))
-            pygame.draw.rect(panel, border, (card_x, 70, card_width, 61), 1)
-            self._blit_text(panel, small_font, label, colour, card_x + 8, 76)
-            self._blit_text(
-                panel, value_font, f"{total:.0f}", (238, 241, 244),
-                card_x + 8, 91)
-            self._blit_text(
-                panel, small_font, f"{hits} hits", (135, 149, 163),
-                card_x + card_width - 52, 109)
+        stats = self.combat_stats_snapshot()
+        if self.active_tab == "stats":
+            self.feed_row_capacity = 0
+            self.feed_rect = None
+            self.scroll_max = 0
+            self.scroll_track_rect = None
+            self.scroll_thumb_rect = None
+            self.scroll_dragging = False
+            self._draw_stats_panel(
+                panel, pygame, width, height, body_font, value_font,
+                small_font, stats)
+        else:
+            snapshot = self.window_totals_snapshot()
+            card_width = (width - 30) // 2
+            cards = (
+                (10, "DEALT", "dealt", snapshot["dealt_total"],
+                 snapshot["dealt_hits"], (255, 104, 88)),
+                (20 + card_width, "RECEIVED", "received",
+                 snapshot["received_total"], snapshot["received_hits"],
+                 (192, 214, 232)),
+            )
+            for card_x, label, key, total, hits, colour in cards:
+                selected = self.active_tab in ("all", key)
+                fill = (14, 21, 29) if selected else (10, 15, 21)
+                border = colour if self.active_tab == key else (42, 55, 68)
+                pygame.draw.rect(panel, fill, (card_x, 70, card_width, 77))
+                pygame.draw.rect(panel, border, (card_x, 70, card_width, 77), 1)
+                self._blit_text(panel, small_font, label, colour, card_x + 8, 76)
+                self._blit_text(
+                    panel, value_font, f"{total:.0f}", (238, 241, 244),
+                    card_x + 8, 91)
+                self._blit_text(
+                    panel, small_font, f"{hits} hits", (135, 149, 163),
+                    card_x + card_width - 52, 109)
+                metric = "DPS" if key == "dealt" else "DTPS"
+                direction = stats[key]
+                self._blit_text(
+                    panel, small_font,
+                    f"{metric} {self._format_metric(direction['dps'])}  "
+                    f"AVG {self._format_metric(direction['average'])}",
+                    (154, 168, 181), card_x + 8, 129)
 
-        heading = {
-            "all": "ALL DAMAGE HISTORY",
-            "dealt": "DAMAGE DEALT HISTORY",
-            "received": "DAMAGE RECEIVED HISTORY",
-        }[self.active_tab]
-        self._blit_text(panel, small_font, heading, (140, 154, 168), 10, 140)
-        pygame.draw.line(panel, (35, 47, 59), (10, 157), (width - 10, 157), 1)
-        row_start = 164
-        feed_height = max(0, height - 25 - row_start)
-        row_limit = max(0, feed_height // 21 + 1)
-        self.feed_row_capacity = row_limit
-        self.feed_rect = (x + 8, y + row_start, max(0, width - 16), feed_height)
-        view = self.feed_view(row_limit)
-        visible_feed = view["rows"]
-        self.scroll_max = view["max_scroll"]
-        self.scroll_track_rect = None
-        self.scroll_thumb_rect = None
-        if self.scroll_max > 0 and feed_height > 0:
-            track_x = x + width - 13
-            track_y = y + row_start
-            track_width = 7
-            thumb_height = max(
-                22, round(feed_height * row_limit / view["total_rows"]))
-            thumb_height = min(feed_height, thumb_height)
-            travel = max(0, feed_height - thumb_height)
-            progress = 1.0 - (view["offset"] / self.scroll_max)
-            thumb_y = track_y + round(travel * progress)
-            self.scroll_track_rect = (
-                track_x, track_y, track_width, feed_height)
-            self.scroll_thumb_rect = (
-                track_x, thumb_y, track_width, thumb_height)
-            pygame.draw.rect(
-                panel, (18, 27, 36),
-                (track_x - x, track_y - y, track_width, feed_height))
-            pygame.draw.rect(
-                panel, (75, 91, 106),
-                (track_x - x, thumb_y - y, track_width, thumb_height))
-            pygame.draw.rect(
-                panel, (119, 137, 153),
-                (track_x - x, thumb_y - y, track_width, thumb_height), 1)
-        for index, entry in enumerate(reversed(visible_feed)):
-            row_y = row_start + index * 21
-            outgoing = entry["direction"] == "dealt"
-            colour = (255, 104, 88) if outgoing else (192, 214, 232)
-            marker = "OUT" if outgoing else " IN"
-            amount = "BLOCK" if entry["blocked"] else f"-{entry['amount']:.0f}"
-            damage_type = str(entry.get("damage_type", "Unknown"))
-            type_colour = _DAMAGE_TYPE_COLOURS.get(
-                damage_type, _DAMAGE_TYPE_COLOURS["Unknown"])
-            target = str(entry["target"])
-            target_x = 177
-            target_right_margin = 22 if self.scroll_max > 0 else 10
-            target_limit = max(
-                8, (width - target_x - target_right_margin) // 7)
-            if len(target) > target_limit:
-                target = target[:max(5, target_limit - 3)] + "..."
-            self._blit_text(panel, body_font, marker, colour, 10, row_y)
-            self._blit_text(panel, body_font, amount, (230, 234, 238), 47, row_y)
+            heading = {
+                "all": "ALL DAMAGE HISTORY",
+                "dealt": "DAMAGE DEALT HISTORY",
+                "received": "DAMAGE RECEIVED HISTORY",
+            }[self.active_tab]
             self._blit_text(
-                panel, body_font, damage_type, type_colour, 106, row_y)
-            self._blit_text(
-                panel, body_font, target, (158, 170, 182), target_x, row_y)
+                panel, small_font, heading, (140, 154, 168), 10, 156)
+            pygame.draw.line(
+                panel, (35, 47, 59), (10, 173), (width - 10, 173), 1)
+            row_start = 180
+            feed_height = max(0, height - 25 - row_start)
+            row_limit = max(0, feed_height // 21 + 1)
+            self.feed_row_capacity = row_limit
+            self.feed_rect = (
+                x + 8, y + row_start, max(0, width - 16), feed_height)
+            view = self.feed_view(row_limit)
+            visible_feed = view["rows"]
+            self.scroll_max = view["max_scroll"]
+            self.scroll_track_rect = None
+            self.scroll_thumb_rect = None
+            if self.scroll_max > 0 and feed_height > 0:
+                track_x = x + width - 13
+                track_y = y + row_start
+                track_width = 7
+                thumb_height = max(
+                    22, round(feed_height * row_limit / view["total_rows"]))
+                thumb_height = min(feed_height, thumb_height)
+                travel = max(0, feed_height - thumb_height)
+                progress = 1.0 - (view["offset"] / self.scroll_max)
+                thumb_y = track_y + round(travel * progress)
+                self.scroll_track_rect = (
+                    track_x, track_y, track_width, feed_height)
+                self.scroll_thumb_rect = (
+                    track_x, thumb_y, track_width, thumb_height)
+                pygame.draw.rect(
+                    panel, (18, 27, 36),
+                    (track_x - x, track_y - y, track_width, feed_height))
+                pygame.draw.rect(
+                    panel, (75, 91, 106),
+                    (track_x - x, thumb_y - y, track_width, thumb_height))
+                pygame.draw.rect(
+                    panel, (119, 137, 153),
+                    (track_x - x, thumb_y - y, track_width, thumb_height), 1)
+            for index, entry in enumerate(reversed(visible_feed)):
+                row_y = row_start + index * 21
+                outgoing = entry["direction"] == "dealt"
+                colour = (255, 104, 88) if outgoing else (192, 214, 232)
+                marker = "OUT" if outgoing else " IN"
+                amount = (
+                    "BLOCK" if entry["blocked"] else f"-{entry['amount']:.0f}")
+                damage_type = str(entry.get("damage_type", "Unknown"))
+                type_colour = _DAMAGE_TYPE_COLOURS.get(
+                    damage_type, _DAMAGE_TYPE_COLOURS["Unknown"])
+                target = str(entry["target"])
+                target_x = 177
+                target_right_margin = 22 if self.scroll_max > 0 else 10
+                target_limit = max(
+                    8, (width - target_x - target_right_margin) // 7)
+                if len(target) > target_limit:
+                    target = target[:max(5, target_limit - 3)] + "..."
+                self._blit_text(panel, body_font, marker, colour, 10, row_y)
+                self._blit_text(
+                    panel, body_font, amount, (230, 234, 238), 47, row_y)
+                self._blit_text(
+                    panel, body_font, damage_type, type_colour, 106, row_y)
+                self._blit_text(
+                    panel, body_font, target, (158, 170, 182), target_x, row_y)
 
         self._blit_text(
             panel, small_font, "F8 show/hide", (92, 106, 119), 10,
@@ -1105,6 +1730,8 @@ class _DamageState:
             self.pools.clear()
             self.feed.clear()
             self.fire_intents.clear()
+            self.weapon_tracks.clear()
+            self.weapon_target_intents.clear()
         self.host = None
         self.pygame = None
         self.window_rect = None

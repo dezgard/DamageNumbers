@@ -5,7 +5,7 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 SOURCE = Path(__file__).parents[1] / "package_source" / "__init__.py"
@@ -30,18 +30,34 @@ def host_with_shields(value: float):
     host._local_player_id = 99
     host._local_x = 0.0
     host._local_y = 0.0
-    host._find_my_entity = lambda: {"player_id": 99}
+    host._local_entity = {
+        "player_id": 99,
+        "energy": 100.0,
+        "max_energy": 100.0,
+        "effective_energy_regen": 0.0,
+        "recv_time": 0.0,
+    }
+    host._find_my_entity = lambda: host._local_entity
     host._space_held = False
     host._autofire = SimpleNamespace(engaged=False)
     host._targeted_npc_id = None
     host._targeted_pid = None
     host._targeted_asteroid_id = None
+    host._proj_interp = {}
+    host._ai_proj_interp = {}
+    host._beams = []
+    host._beams_lock = threading.RLock()
+    host._turret_beams = []
+    host._turret_beams_lock = threading.RLock()
+    host._station_beams = []
+    host._station_beams_lock = threading.RLock()
     return host
 
 
 class DamageNumberTests(unittest.TestCase):
     def setUp(self):
         module = load_module()
+        self.module = module
         self.logger = SimpleNamespace(debug=Mock(), exception=Mock())
         self.state = module._DamageState(SimpleNamespace(logger=self.logger))
         self.host = host_with_shields(100.0)
@@ -208,6 +224,186 @@ class DamageNumberTests(unittest.TestCase):
         self.assertEqual("Pirate Raider", snapshot["feed"][0]["target"])
         self.assertEqual("Thermal", snapshot["feed"][0]["damage_type"])
 
+    def test_combat_stats_calculate_dps_averages_peaks_and_types(self):
+        timed_hits = (
+            (100.0, 7, 100.0, "dealt", 99, "Kinetic"),
+            (102.0, 7, 50.0, "dealt", 99, "Thermal"),
+            (103.0, 99, 25.0, "received", "npc-raider", "Laser"),
+        )
+        for when, target, amount, direction, attacker, damage_type in timed_hits:
+            with patch.object(self.module.time, "monotonic", return_value=when):
+                self.state._record_window_hit(
+                    self.host, target, amount, direction, "ship", attacker,
+                    damage_type)
+
+        stats = self.state.combat_stats_snapshot(now=104.0)
+
+        self.assertEqual("active", stats["status"])
+        self.assertEqual(3.0, stats["duration"])
+        self.assertAlmostEqual(50.0, stats["dealt"]["dps"])
+        self.assertAlmostEqual(75.0, stats["dealt"]["average"])
+        self.assertEqual(100.0, stats["dealt"]["maximum"])
+        self.assertAlmostEqual(2.0 / 3.0, stats["dealt"]["hits_per_second"])
+        self.assertAlmostEqual(25.0 / 3.0, stats["received"]["dps"])
+        self.assertEqual("Kinetic", stats["dealt"]["types"][0]["label"])
+        self.assertAlmostEqual(
+            100.0 / 150.0 * 100.0,
+            stats["dealt"]["types"][0]["percent"],
+        )
+        self.assertFalse(stats["dpe_available"])
+        self.assertEqual(0.0, stats["dpe"])
+        self.assertEqual(0.0, stats["energy_used"])
+
+    def test_dpe_uses_regeneration_compensated_encounter_energy(self):
+        self.host._local_entity.update({
+            "energy": 100.0,
+            "effective_energy_regen": 10.0,
+            "recv_time": 0.0,
+        })
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state._observe_energy(self.host)
+        self.host._local_entity.update({"energy": 80.0, "recv_time": 1.0})
+        with patch.object(self.module.time, "monotonic", return_value=101.0):
+            self.state._observe_energy(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=101.5):
+            self.state._record_window_hit(
+                self.host, 7, 300.0, "dealt", "ship", 99, "Kinetic")
+
+        stats = self.state.combat_stats_snapshot(now=102.0)
+
+        self.assertAlmostEqual(30.0, stats["energy_used"])
+        self.assertAlmostEqual(10.0, stats["dpe"])
+        self.assertTrue(stats["dpe_available"])
+
+    def test_full_energy_does_not_invent_regeneration_spend(self):
+        self.host._local_entity.update({
+            "energy": 100.0,
+            "effective_energy_regen": 10.0,
+            "recv_time": 0.0,
+        })
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state._observe_energy(self.host)
+        self.host._local_entity["recv_time"] = 1.0
+        with patch.object(self.module.time, "monotonic", return_value=101.0):
+            self.state._observe_energy(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=101.5):
+            self.state._record_window_hit(
+                self.host, 7, 300.0, "dealt", "ship", 99, "Kinetic")
+
+        stats = self.state.combat_stats_snapshot(now=102.0)
+
+        self.assertEqual(0.0, stats["energy_used"])
+        self.assertEqual(0.0, stats["dpe"])
+
+    def test_natural_energy_regeneration_is_not_counted_as_spend(self):
+        self.host._local_entity.update({
+            "energy": 80.0,
+            "effective_energy_regen": 10.0,
+            "recv_time": 0.0,
+        })
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state._observe_energy(self.host)
+        self.host._local_entity.update({"energy": 90.0, "recv_time": 1.0})
+        with patch.object(self.module.time, "monotonic", return_value=101.0):
+            self.state._observe_energy(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=101.5):
+            self.state._record_window_hit(
+                self.host, 7, 300.0, "dealt", "ship", 99, "Kinetic")
+
+        stats = self.state.combat_stats_snapshot(now=102.0)
+
+        self.assertEqual(0.0, stats["energy_used"])
+
+    def test_same_energy_snapshot_is_only_observed_once(self):
+        self.host._local_entity.update({
+            "energy": 90.0,
+            "effective_energy_regen": 10.0,
+            "recv_time": 0.0,
+        })
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state._observe_energy(self.host)
+        self.host._local_entity.update({"energy": 80.0, "recv_time": 1.0})
+        with patch.object(self.module.time, "monotonic", return_value=101.0):
+            self.state._observe_energy(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=101.5):
+            self.state._observe_energy(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=101.6):
+            self.state._record_window_hit(
+                self.host, 7, 200.0, "dealt", "ship", 99, "Kinetic")
+
+        stats = self.state.combat_stats_snapshot(now=102.0)
+
+        self.assertAlmostEqual(20.0, stats["energy_used"])
+        self.assertAlmostEqual(10.0, stats["dpe"])
+
+    def test_energy_spend_after_first_hit_updates_active_encounter(self):
+        self.host._local_entity.update({
+            "energy": 100.0,
+            "effective_energy_regen": 10.0,
+            "recv_time": 0.0,
+        })
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state._observe_energy(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.1):
+            self.state._record_window_hit(
+                self.host, 7, 300.0, "dealt", "ship", 99, "Kinetic")
+        self.host._local_entity.update({"energy": 80.0, "recv_time": 1.0})
+        with patch.object(self.module.time, "monotonic", return_value=101.0):
+            self.state._observe_energy(self.host)
+
+        stats = self.state.combat_stats_snapshot(now=102.0)
+
+        self.assertAlmostEqual(30.0, stats["energy_used"])
+        self.assertAlmostEqual(10.0, stats["dpe"])
+
+    def test_rolling_dps_uses_only_the_last_ten_seconds(self):
+        with patch.object(self.module.time, "monotonic", return_value=0.0):
+            self.state._record_window_hit(
+                self.host, 7, 100.0, "dealt", "ship", 99, "Kinetic")
+        with patch.object(self.module.time, "monotonic", return_value=5.0):
+            self.state._record_window_hit(
+                self.host, 7, 50.0, "dealt", "ship", 99, "Thermal")
+
+        stats = self.state.combat_stats_snapshot(now=12.0)
+
+        self.assertAlmostEqual(30.0, stats["dealt"]["dps"])
+        self.assertAlmostEqual(5.0, stats["dealt"]["rolling_dps"])
+
+    def test_quiet_period_finishes_then_next_hit_starts_new_encounter(self):
+        with patch.object(self.module.time, "monotonic", return_value=0.0):
+            self.state._record_window_hit(
+                self.host, 7, 100.0, "dealt", "ship", 99, "Kinetic")
+
+        finished = self.state.combat_stats_snapshot(now=11.0)
+
+        self.assertEqual("complete", finished["status"])
+        self.assertEqual(100.0, finished["dealt"]["total"])
+        with patch.object(self.module.time, "monotonic", return_value=12.0):
+            self.state._record_window_hit(
+                self.host, 7, 40.0, "dealt", "ship", 99, "Thermal")
+        next_encounter = self.state.combat_stats_snapshot(now=13.0)
+        session = self.state.window_totals_snapshot()
+
+        self.assertEqual("active", next_encounter["status"])
+        self.assertEqual(40.0, next_encounter["dealt"]["total"])
+        self.assertEqual(140.0, session["dealt_total"])
+
+    def test_clear_window_resets_encounter_statistics(self):
+        with patch.object(self.module.time, "monotonic", return_value=10.0):
+            self.state._record_window_hit(
+                self.host, 7, 100.0, "dealt", "ship", 99, "Kinetic")
+
+        self.state.clear_window()
+        stats = self.state.combat_stats_snapshot(now=11.0)
+
+        self.assertEqual("idle", stats["status"])
+        self.assertEqual(0.0, stats["dealt"]["dps"])
+        self.assertEqual((), stats["dealt"]["types"])
+        self.assertEqual(0.0, stats["energy_used"])
+        self.assertEqual(0.0, stats["dpe"])
+        self.assertIsNone(self.state.energy_previous)
+        self.assertEqual([], list(self.state.energy_recent_spend))
+
     def test_all_canonical_damage_types_use_full_names(self):
         expected = {
             "kinetic": "Kinetic",
@@ -277,6 +473,126 @@ class DamageNumberTests(unittest.TestCase):
 
         self.state.record_ship_hit(
             self.host, {"target_id": "npc-bystander", "damage": 12.0})
+
+        self.assertEqual((), self.state.window_snapshot()["feed"])
+
+    def test_local_turret_beam_counts_without_main_weapon_input(self):
+        self.host._turret_beams = [({
+            "owner_id": 99,
+            "ox": 0.0,
+            "oy": 0.0,
+            "ex": 10.0,
+            "ey": 20.0,
+        }, 100.0)]
+
+        with patch.object(self.module.time, "monotonic", return_value=100.1):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+
+        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+
+    def test_local_projectile_counts_after_it_leaves_client_snapshot(self):
+        self.host._proj_interp = {
+            "round-1": {
+                "owner_id": 99,
+                "x": -40.0,
+                "y": 20.0,
+                "vx": 500.0,
+                "vy": 0.0,
+                "radius": 3.0,
+            },
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+        self.host._proj_interp = {}
+
+        with patch.object(self.module.time, "monotonic", return_value=100.1):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+
+        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+
+    def test_player_owned_fighter_projectile_counts_as_dealt(self):
+        self.host._npc_entities["fighter-alpha"] = {
+            "display_name": "My Fighter",
+            "owner_id": 99,
+            "x": 0.0,
+            "y": 0.0,
+        }
+        self.host._ai_proj_interp = {
+            "fighter-round": {
+                "owner_id": "fighter-alpha",
+                "x": -40.0,
+                "y": 20.0,
+                "vx": 500.0,
+                "vy": 0.0,
+                "radius": 3.0,
+            },
+        }
+
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+
+        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+
+    def test_other_players_projectile_near_target_is_ignored(self):
+        self.host._proj_interp = {
+            "other-round": {
+                "owner_id": 55,
+                "x": 10.0,
+                "y": 20.0,
+                "vx": 0.0,
+                "vy": 0.0,
+                "radius": 3.0,
+            },
+        }
+
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+
+        self.assertEqual((), self.state.window_snapshot()["feed"])
+
+    def test_local_projectile_for_a_different_target_is_ignored(self):
+        self.host._proj_interp = {
+            "distant-round": {
+                "owner_id": 99,
+                "x": 300.0,
+                "y": 300.0,
+                "vx": 10.0,
+                "vy": 0.0,
+                "radius": 3.0,
+            },
+        }
+
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+
+        self.assertEqual((), self.state.window_snapshot()["feed"])
+
+    def test_expired_local_projectile_evidence_is_ignored(self):
+        self.host._proj_interp = {
+            "old-round": {
+                "owner_id": 99,
+                "x": -40.0,
+                "y": 20.0,
+                "vx": 500.0,
+                "vy": 0.0,
+                "radius": 3.0,
+            },
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+        self.host._proj_interp = {}
+
+        with patch.object(self.module.time, "monotonic", return_value=101.0):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
 
         self.assertEqual((), self.state.window_snapshot()["feed"])
 
