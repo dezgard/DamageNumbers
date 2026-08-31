@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3
+
+- Added a Stats tab with encounter and rolling 10-second DPS, incoming DPS,
+  average and largest hits, hit rate, blocked hits and damage-type totals.
+- Added top target and attacker totals for the current encounter.
+- Added ship-wide damage-per-energy and total-energy figures using the live
+  energy bank and regeneration data supplied by the client.
+- Improved ownership checks for player turrets, fighters and other
+  player-owned attacks while continuing to ignore unrelated nearby combat.
+- Added compatibility with Star Empire 0.4.71, 0.4.73 and 0.4.91.
+
 ## v0.2
 
 - Added a movable and resizable Damage Report, shown or hidden with F8.
