@@ -40,5 +40,6 @@ Damage per energy uses the ship's live energy use during the encounter and
 accounts for energy regenerated between updates. It is a ship-wide efficiency
 figure, not a per-weapon breakdown.
 
-Tested with Star Empire 0.4.62, 0.4.63, 0.4.66, 0.4.71, 0.4.73, and 0.4.91
+Tested with Star Empire 0.4.62, 0.4.63, 0.4.66, 0.4.71, 0.4.73, 0.4.91,
+and 0.4.94
 using Mod Loader API 1.

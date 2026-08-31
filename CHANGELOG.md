@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4
+
+- Added compatibility with Star Empire 0.4.94.
+
 ## v0.3
 
 - Added a Stats tab with encounter and rolling 10-second DPS, incoming DPS,
