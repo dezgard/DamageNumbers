@@ -54,6 +54,22 @@ def host_with_shields(value: float):
     return host
 
 
+class HookHost:
+    def register_hit(self, hit):
+        self.original_hits.append(hit)
+
+    def register_asteroid_hit(self, hit):
+        self.original_asteroid_hits.append(hit)
+
+    def add_turret_beam(self, beam):
+        self.original_beams.append(beam)
+
+    def set_projectiles(self, payload):
+        self._proj_interp = {
+            row["id"]: dict(row) for row in payload if "id" in row
+        }
+
+
 class DamageNumberTests(unittest.TestCase):
     def setUp(self):
         module = load_module()
@@ -439,32 +455,879 @@ class DamageNumberTests(unittest.TestCase):
             },
         }
         self.host._targeted_npc_id = "fa5dc56b"
-        self.host._space_held = True
-        self.state.snapshot(self.host)
-
-        self.state.record_ship_hit(
-            self.host,
-            {
-                "target_id": "npc-fa5dc56b",
-                "entity_id": "npc-fa5dc56b",
-                "damage": 12.0,
+        self.host._proj_interp = {
+            "name-test-round": {
+                "owner_id": 99,
+                "x": 20.0,
+                "y": 40.0,
+                "vx": 100.0,
+                "vy": 0.0,
+                "radius": 3.0,
+                "weapon": "Test Cannon",
             },
-        )
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+            self.state.record_ship_hit(
+                self.host,
+                {
+                    "target_id": "npc-fa5dc56b",
+                    "entity_id": "npc-fa5dc56b",
+                    "damage": 12.0,
+                },
+            )
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
 
         snapshot = self.state.window_snapshot()
         self.assertEqual("Pirate Raider", snapshot["feed"][0]["target"])
 
-    def test_active_fire_accepts_unattributed_hit_on_selected_target(self):
+    def test_main_fire_alone_does_not_claim_an_unattributed_hit(self):
         self.host._targeted_npc_id = "npc-raider"
         self.host._space_held = True
-        self.state.snapshot(self.host)
-
-        self.state.record_ship_hit(
-            self.host, {"target_id": "npc-raider", "damage": 12.0})
+        self.host._local_entity["active_weapon_name"] = "Corsair Thumper"
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+            self.state.record_ship_hit(
+                self.host, {"target_id": "npc-raider", "damage": 12.0})
 
         snapshot = self.state.window_snapshot()
-        self.assertEqual(12.0, snapshot["dealt_total"])
-        self.assertEqual("dealt", snapshot["feed"][0]["direction"])
+        self.assertEqual(0.0, snapshot["dealt_total"])
+        self.assertEqual(1, len(self.state.pending_hits))
+
+        with patch.object(self.module.time, "monotonic", return_value=100.50):
+            self.state.snapshot(self.host)
+
+        self.assertEqual((), self.state.window_snapshot()["feed"])
+        self.assertEqual(0, len(self.state.pending_hits))
+
+    def test_local_main_beam_keeps_weapon_captured_at_fire_time(self):
+        self.host._local_entity["active_weapon_name"] = "Patriot Beam"
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state._remember_beam_event(
+                "_beams",
+                {"owner_id": 99, "ox": 0.0, "oy": 0.0,
+                 "ex": 10.0, "ey": 20.0},
+            )
+
+        # A weapon switch after the beam starts must not rename its hit.
+        self.host._local_entity["active_weapon_name"] = "Kraken's Tooth"
+        with patch.object(self.module.time, "monotonic", return_value=100.02):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 5621.6,
+                 "damage_type": "kinetic"},
+                channel="DUNGEON_AI_HIT_ENTITY ",
+            )
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        feed = self.state.window_snapshot()["feed"]
+        self.assertEqual("Patriot Beam", feed[0]["weapon"])
+        self.assertNotIn("Kraken", feed[0]["weapon"])
+
+    def test_late_projectile_resolves_hit_without_main_weapon_input(self):
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+        self.assertEqual(1, len(self.state.pending_hits))
+
+        self.host._proj_interp = {
+            "late-patriot-round": {
+                "owner_id": 99,
+                "x": -40.0,
+                "y": 20.0,
+                "vx": 500.0,
+                "vy": 0.0,
+                "radius": 3.0,
+                "weapon": "Patriot Beam",
+            },
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        feed = self.state.window_snapshot()["feed"]
+        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+        self.assertEqual("Patriot Beam", feed[0]["weapon"])
+        self.assertEqual(100.0, feed[0]["when"])
+        self.assertEqual(0, len(self.state.pending_hits))
+
+    def test_late_turret_beam_resolves_hit_without_main_weapon_input(self):
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+
+        self.host._turret_beams = [({
+            "owner_id": 99,
+            "ox": 0.0,
+            "oy": 0.0,
+            "ex": 10.0,
+            "ey": 20.0,
+            "hardpoint_index": 2,
+        }, 100.02)]
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 2,
+                "weapon_type": "blaze_cannon",
+                "weapon_def": {"display_name": "Blaze Cannon"},
+            }],
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        feed = self.state.window_snapshot()["feed"]
+        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+        self.assertEqual("Blaze Cannon", feed[0]["weapon"])
+
+    def test_event_hooks_capture_brief_beam_and_restore_cleanly(self):
+        base = host_with_shields(100.0)
+        host = HookHost()
+        host.__dict__.update(vars(base))
+        host._find_my_entity = lambda: host._local_entity
+        host.original_hits = []
+        host.original_asteroid_hits = []
+        host.original_beams = []
+        host._turret_state = {
+            "hardpoints": [{
+                "index": 2,
+                "weapon_type": "blaze_cannon",
+                "weapon_def": {"display_name": "Blaze Cannon"},
+            }],
+        }
+        original_beam_method = HookHost.add_turret_beam
+        original_projectile_method = HookHost.set_projectiles
+        state = self.module._DamageState(
+            SimpleNamespace(logger=self.logger))
+
+        try:
+            with patch.object(self.module.time, "monotonic", return_value=100.0):
+                state.install(host, None)
+                state.record_ship_hit(host, {"target_id": 7, "damage": 12.0})
+            with patch.object(self.module.time, "monotonic", return_value=100.03):
+                host.add_turret_beam({
+                    "owner_id": 99,
+                    "ox": 0.0,
+                    "oy": 0.0,
+                    "ex": 10.0,
+                    "ey": 20.0,
+                    "hardpoint_index": 2,
+                })
+            with patch.object(self.module.time, "monotonic", return_value=100.06):
+                state.snapshot(host)
+            with patch.object(self.module.time, "monotonic", return_value=100.18):
+                state.snapshot(host)
+
+            self.assertEqual("Blaze Cannon", state.window_snapshot()["feed"][0]["weapon"])
+            self.assertIsNot(HookHost.add_turret_beam, original_beam_method)
+            self.assertIsNot(HookHost.set_projectiles, original_projectile_method)
+        finally:
+            state.uninstall()
+
+        self.assertIs(HookHost.add_turret_beam, original_beam_method)
+        self.assertIs(HookHost.set_projectiles, original_projectile_method)
+
+    def test_one_beam_event_cannot_authorize_two_pending_hits(self):
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 2,
+                "weapon_type": "blaze_cannon",
+                "weapon_def": {"display_name": "Blaze Cannon"},
+            }],
+        }
+        beam = {
+            "owner_id": 99,
+            "ox": 0.0,
+            "oy": 0.0,
+            "ex": 10.0,
+            "ey": 20.0,
+            "hardpoint_index": 2,
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 8.0})
+        self.state._remember_beam_event("_turret_beams", beam, 100.02)
+
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+        self.assertEqual(1, len(self.state.pending_hits))
+
+        with patch.object(self.module.time, "monotonic", return_value=100.50):
+            self.state.snapshot(self.host)
+        self.assertEqual(0, len(self.state.pending_hits))
+
+    def test_two_beam_events_can_authorize_two_pending_hits(self):
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 2,
+                "weapon_type": "blaze_cannon",
+                "weapon_def": {"display_name": "Blaze Cannon"},
+            }],
+        }
+        beam = {
+            "owner_id": 99,
+            "ox": 0.0,
+            "oy": 0.0,
+            "ex": 10.0,
+            "ey": 20.0,
+            "hardpoint_index": 2,
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 8.0})
+        self.state._remember_beam_event("_turret_beams", beam, 100.02)
+        self.state._remember_beam_event("_turret_beams", beam, 100.03)
+
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        self.assertEqual(20.0, self.state.window_snapshot()["dealt_total"])
+        self.assertEqual(0, len(self.state.pending_hits))
+
+    def test_burn_tick_does_not_steal_mixed_turret_evidence(self):
+        self.host._local_entity["active_weapon_name"] = "Kraken's Tooth"
+        self.host._turret_state = {
+            "hardpoints": [
+                *[{
+                    "index": index,
+                    "weapon_type": "patriot_beam",
+                    "effective_damage": 5621.6,
+                    "weapon_def": {
+                        "display_name": "Patriot Beam",
+                        "damage_type": "kinetic",
+                    },
+                } for index in range(4)],
+                *[{
+                    "index": index,
+                    "weapon_type": "blaze_cannon",
+                    "effective_damage": 1410.2,
+                    "weapon_def": {
+                        "display_name": "Blaze Cannon",
+                        "damage_type": "thermal",
+                        "description": "Sets targets alight.",
+                    },
+                } for index in range(4, 6)],
+            ],
+        }
+        channel = "DUNGEON_AI_HIT_ENTITY "
+
+        # The live server can deliver the periodic tick just before the direct
+        # burst that shares its visual update. Resolve the larger direct hit
+        # first, then retain the tick as the Blaze burn effect.
+        with patch.object(self.module.time, "monotonic", return_value=99.95):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 90.0, "damage_type": "kinetic"},
+                channel=channel,
+            )
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 1410.2, "damage_type": "thermal"},
+                channel=channel,
+            )
+        self.state._remember_beam_event(
+            "_turret_beams",
+            {"owner_id": 99, "ox": 0.0, "oy": 0.0,
+             "ex": 10.0, "ey": 20.0},
+            100.03,
+        )
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        # Repeat the real collision: a low burn tick overlaps a Patriot beam.
+        with patch.object(self.module.time, "monotonic", return_value=100.95):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 45.0, "damage_type": "kinetic"},
+                channel=channel,
+            )
+        with patch.object(self.module.time, "monotonic", return_value=101.04):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 5621.6, "damage_type": "kinetic"},
+                channel=channel,
+            )
+        self.state._remember_beam_event(
+            "_turret_beams",
+            {"owner_id": 99, "ox": 0.0, "oy": 0.0,
+             "ex": 10.0, "ey": 20.0},
+            101.02,
+        )
+        with patch.object(self.module.time, "monotonic", return_value=101.22):
+            self.state.snapshot(self.host)
+
+        rows = self.state.window_snapshot()["feed"]
+        by_amount = {row["amount"]: row for row in rows}
+        self.assertEqual("Blaze Cannon", by_amount[1410.2]["weapon"])
+        self.assertEqual("Thermal", by_amount[1410.2]["damage_type"])
+        self.assertEqual(
+            "Blaze Cannon (Possible Burn)", by_amount[90.0]["weapon"])
+        self.assertEqual("Fires", by_amount[90.0]["damage_type"])
+        self.assertEqual("Kinetic", by_amount[90.0]["server_damage_type"])
+        self.assertEqual("Blaze Cannon (Burn)", by_amount[45.0]["weapon"])
+        self.assertEqual("Fires", by_amount[45.0]["damage_type"])
+        self.assertEqual("Kinetic", by_amount[45.0]["server_damage_type"])
+        self.assertIn(
+            5621.6, by_amount,
+            msg=(rows, list(self.state.pending_hits)),
+        )
+        self.assertEqual("Patriot Beam", by_amount[5621.6]["weapon"])
+        self.assertNotIn("Kraken", " ".join(row["weapon"] for row in rows))
+
+    def test_closest_visual_wins_when_direct_hit_is_smaller_than_burn(self):
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 0,
+                "weapon_type": "patriot_beam",
+                "effective_damage": 5621.6,
+                "weapon_def": {
+                    "display_name": "Patriot Beam",
+                    "damage_type": "kinetic",
+                },
+            }, {
+                "index": 4,
+                "weapon_type": "blaze_cannon",
+                "effective_damage": 1410.2,
+                "weapon_def": {
+                    "display_name": "Blaze Cannon",
+                    "damage_type": "thermal",
+                    "description": "Sets targets alight.",
+                },
+            }],
+        }
+        channel = "DUNGEON_AI_HIT_ENTITY "
+        evidence = {
+            "weapon": "Blaze Cannon",
+            "evidence_kind": "beam",
+            "dot_capable": True,
+        }
+        tick = {"damage": 90.0, "damage_type": "kinetic"}
+        self.state._remember_effect_source(
+            7, 99, evidence, 1410.2, "Thermal", 98.0, channel)
+        self.state._recent_effect_match(tick, 7, None, 98.5, channel)
+        self.state._recent_effect_match(tick, 7, None, 99.5, channel)
+
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, **tick}, channel=channel)
+        with patch.object(self.module.time, "monotonic", return_value=100.05):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 20.0,
+                 "damage_type": "kinetic"},
+                channel=channel,
+            )
+        self.state._remember_beam_event(
+            "_turret_beams",
+            {"owner_id": 99, "ox": 0.0, "oy": 0.0,
+             "ex": 10.0, "ey": 20.0},
+            100.04,
+        )
+        with patch.object(self.module.time, "monotonic", return_value=100.21):
+            self.state.snapshot(self.host)
+
+        by_amount = {
+            row["amount"]: row
+            for row in self.state.window_snapshot()["feed"]
+        }
+        self.assertEqual("Patriot Beam", by_amount[20.0]["weapon"])
+        self.assertEqual("Blaze Cannon (Burn)", by_amount[90.0]["weapon"])
+        self.assertEqual(0, len(self.state.pending_hits))
+
+    def test_pending_batch_reuses_one_projectile_snapshot(self):
+        self.host._proj_interp = {
+            "one": {
+                "owner_id": 99,
+                "x": -40.0, "y": 20.0,
+                "vx": 500.0, "vy": 0.0, "radius": 3.0,
+                "weapon": "Patriot Beam",
+            },
+            "two": {
+                "owner_id": 99,
+                "x": -42.0, "y": 20.0,
+                "vx": 500.0, "vy": 0.0, "radius": 3.0,
+                "weapon": "Patriot Beam",
+            },
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state._observe_owned_projectiles(self.host)
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 8.0})
+
+        original = self.state._observe_owned_projectiles
+        with patch.object(
+                self.state, "_observe_owned_projectiles",
+                wraps=original) as observe:
+            with patch.object(
+                    self.module.time, "monotonic", return_value=100.18):
+                self.state._resolve_pending_hits(self.host)
+
+        self.assertEqual(1, observe.call_count)
+        self.assertEqual(0, len(self.state.pending_hits))
+
+    def test_low_indexed_patriot_hit_wins_over_active_blaze_context(self):
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 0,
+                "weapon_type": "patriot_beam",
+                "effective_damage": 5621.6,
+                "weapon_def": {
+                    "display_name": "Patriot Beam",
+                    "damage_type": "kinetic",
+                },
+            }, {
+                "index": 4,
+                "weapon_type": "blaze_cannon",
+                "effective_damage": 1410.2,
+                "weapon_def": {
+                    "display_name": "Blaze Cannon",
+                    "damage_type": "thermal",
+                    "description": "Sets targets alight.",
+                },
+            }],
+        }
+        channel = "DUNGEON_AI_HIT_ENTITY "
+        self.state._remember_effect_source(
+            7, 99,
+            {"weapon": "Blaze Cannon", "evidence_kind": "beam",
+             "dot_capable": True},
+            1410.2, "Thermal", 100.0, channel,
+        )
+
+        with patch.object(self.module.time, "monotonic", return_value=100.50):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 90.0,
+                 "damage_type": "kinetic"},
+                channel=channel,
+            )
+        self.state._remember_beam_event(
+            "_turret_beams",
+            {"owner_id": 99, "ox": 0.0, "oy": 0.0,
+             "ex": 10.0, "ey": 20.0, "hardpoint_index": 0},
+            100.52,
+        )
+        with patch.object(self.module.time, "monotonic", return_value=100.68):
+            self.state.snapshot(self.host)
+
+        row = self.state.window_snapshot()["feed"][0]
+        self.assertEqual("Patriot Beam", row["weapon"])
+        self.assertEqual(90.0, row["amount"])
+        self.assertEqual(0, len(self.state.pending_hits))
+
+    def test_named_mitigated_turret_event_keeps_its_weapon(self):
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 0,
+                "weapon_type": "patriot_beam",
+                "effective_damage": 5621.6,
+                "weapon_def": {
+                    "display_name": "Patriot Beam",
+                    "damage_type": "kinetic",
+                },
+            }],
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 562.16,
+                 "damage_type": "kinetic"},
+                channel="DUNGEON_AI_HIT_ENTITY ",
+            )
+        self.state._remember_beam_event(
+            "_turret_beams",
+            {"owner_id": 99, "ox": 0.0, "oy": 0.0,
+             "ex": 10.0, "ey": 20.0, "weapon_name": "Patriot Beam"},
+            100.02,
+        )
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        row = self.state.window_snapshot()["feed"][0]
+        self.assertEqual("Patriot Beam", row["weapon"])
+        self.assertEqual(562.16, row["amount"])
+
+    def test_unnamed_mitigated_turret_uses_unique_hit_signature(self):
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 0,
+                "weapon_type": "patriot_beam",
+                "effective_damage": 5621.6,
+                "weapon_def": {
+                    "display_name": "Patriot Beam",
+                    "damage_type": "kinetic",
+                },
+            }, {
+                "index": 4,
+                "weapon_type": "blaze_cannon",
+                "effective_damage": 1410.2,
+                "weapon_def": {
+                    "display_name": "Blaze Cannon",
+                    "damage_type": "thermal",
+                },
+            }],
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 562.16,
+                 "damage_type": "kinetic"},
+                channel="DUNGEON_AI_HIT_ENTITY ",
+            )
+        self.state._remember_beam_event(
+            "_turret_beams",
+            {"owner_id": 99, "ox": 0.0, "oy": 0.0,
+             "ex": 10.0, "ey": 20.0},
+            100.02,
+        )
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        self.assertEqual(
+            "Patriot Beam",
+            self.state.window_snapshot()["feed"][0]["weapon"],
+        )
+
+    def test_burn_confirmation_resets_after_a_new_application_gap(self):
+        channel = "DUNGEON_AI_HIT_ENTITY "
+        evidence = {
+            "weapon": "Blaze Cannon",
+            "evidence_kind": "beam",
+            "dot_capable": True,
+        }
+        tick = {"damage": 45.0, "damage_type": "kinetic"}
+        self.state._remember_effect_source(
+            7, 99, evidence, 1410.2, "Thermal", 100.0, channel)
+
+        first = self.state._recent_effect_match(
+            tick, 7, None, 100.5, channel)
+        second = self.state._recent_effect_match(
+            tick, 7, None, 101.5, channel)
+        self.assertEqual("possible_burn", first["effect_kind"])
+        self.assertEqual("burn", second["effect_kind"])
+
+        self.state._remember_effect_source(
+            7, 99, evidence, 1410.2, "Thermal", 102.0, channel)
+        after_continuous_refresh = self.state._recent_effect_match(
+            tick, 7, None, 102.05, channel)
+        self.assertEqual("burn", after_continuous_refresh["effect_kind"])
+
+        self.state._remember_effect_source(
+            7, 99, evidence, 1410.2, "Thermal", 104.1, channel)
+        after_refresh = self.state._recent_effect_match(
+            tick, 7, None, 104.6, channel)
+        self.assertEqual("possible_burn", after_refresh["effect_kind"])
+
+    def test_stacked_blaze_ticks_continue_after_direct_fire_stops(self):
+        channel = "DUNGEON_AI_HIT_ENTITY "
+        evidence = {
+            "weapon": "Blaze Cannon",
+            "evidence_kind": "beam",
+            "dot_capable": True,
+        }
+        tick = {"damage": 540.0, "damage_type": "kinetic"}
+
+        # Six simultaneous direct Blaze hits establish the maximum observed
+        # stack burst.  The resulting 540 fire tick is larger than the old
+        # one-source ceiling, but is still below the evidence-based limit.
+        for _ in range(6):
+            self.state._remember_effect_source(
+                7, 99, evidence, 1410.2, "Thermal", 100.0, channel)
+
+        first = self.state._recent_effect_match(
+            tick, 7, None, 100.5, channel)
+        second = self.state._recent_effect_match(
+            tick, 7, None, 101.5, channel)
+        self.assertEqual("possible_burn", first["effect_kind"])
+        self.assertEqual("burn", second["effect_kind"])
+
+        result = None
+        for event_at in range(102, 111):
+            result = self.state._recent_effect_match(
+                tick, 7, None, event_at + 0.5, channel)
+            self.assertEqual("burn", result["effect_kind"])
+
+        source = self.state.effect_sources[0]
+        self.assertEqual(6, source["stack_ceiling"])
+        self.assertGreater(source["expires_at"], 110.5)
+
+    def test_sustained_blaze_fire_preserves_burn_and_encounter_stats(self):
+        channel = "DUNGEON_AI_HIT_ENTITY "
+        evidence = {
+            "weapon": "Blaze Cannon",
+            "evidence_kind": "beam",
+            "dot_capable": True,
+        }
+        hit = {"target_id": 7, "damage": 540.0, "damage_type": "kinetic"}
+
+        # A six-weapon Blaze burst establishes the stacked fire context.  The
+        # next direct burst happens more than two seconds after the first one,
+        # but less than two seconds after the last activity.  It must preserve
+        # the confirmed effect rather than reset its stack evidence.
+        for _ in range(6):
+            self.state._remember_effect_source(
+                7, 99, evidence, 1410.2, "Thermal", 100.0, channel)
+        for event_at in (100.5, 101.5):
+            self.assertTrue(self.state.record_ship_hit(
+                self.host, hit, allow_defer=False,
+                event_at=event_at, channel=channel))
+        for _ in range(6):
+            self.state._remember_effect_source(
+                7, 99, evidence, 1410.2, "Thermal", 102.25, channel)
+        for event_at in (102.5, *[second + 0.5 for second in range(103, 113)]):
+            self.assertTrue(self.state.record_ship_hit(
+                self.host, hit, allow_defer=False,
+                event_at=event_at, channel=channel))
+
+        rows = {row["when"]: row for row in self.state.window_snapshot()["feed"]}
+        self.assertEqual("Blaze Cannon (Burn)", rows[102.5]["weapon"])
+        self.assertEqual("Fires", rows[102.5]["damage_type"])
+        self.assertEqual(6, self.state.effect_sources[0]["stack_ceiling"])
+
+        stats = self.state.combat_stats_snapshot(now=113.0)
+        self.assertEqual("active", stats["status"])
+        self.assertEqual(13, stats["dealt"]["hits"])
+        self.assertAlmostEqual(13 * 540.0, stats["dealt"]["total"])
+
+    def test_confirmed_burn_rejects_off_cadence_source_free_hit(self):
+        channel = "DUNGEON_AI_HIT_ENTITY "
+        evidence = {
+            "weapon": "Blaze Cannon",
+            "evidence_kind": "beam",
+            "dot_capable": True,
+        }
+        tick = {"damage": 90.0, "damage_type": "kinetic"}
+        self.state._remember_effect_source(
+            7, 99, evidence, 1410.2, "Thermal", 100.0, channel)
+
+        self.state._recent_effect_match(tick, 7, None, 100.5, channel)
+        self.state._recent_effect_match(tick, 7, None, 101.5, channel)
+
+        self.assertIsNone(self.state._recent_effect_match(
+            tick, 7, None, 101.7, channel))
+        self.assertEqual("burn", self.state._recent_effect_match(
+            tick, 7, None, 102.5, channel)["effect_kind"])
+
+    def test_confirmed_burn_allows_whole_stack_changes(self):
+        channel = "DUNGEON_AI_HIT_ENTITY "
+        evidence = {
+            "weapon": "Blaze Cannon",
+            "evidence_kind": "beam",
+            "dot_capable": True,
+        }
+        for _ in range(6):
+            self.state._remember_effect_source(
+                7, 99, evidence, 1410.2, "Thermal", 100.0, channel)
+
+        self.state._recent_effect_match(
+            {"damage": 540.0, "damage_type": "kinetic"},
+            7, None, 100.5, channel)
+        result = self.state._recent_effect_match(
+            {"damage": 450.0, "damage_type": "kinetic"},
+            7, None, 101.5, channel)
+        self.assertEqual("burn", result["effect_kind"])
+
+    def test_protocol_channel_context_is_scoped_and_restored(self):
+        base = host_with_shields(100.0)
+        host = HookHost()
+        host.__dict__.update(vars(base))
+        host._find_my_entity = lambda: host._local_entity
+        host.original_hits = []
+        host.original_asteroid_hits = []
+        host.original_beams = []
+
+        class FakeApp:
+            def __init__(self, window):
+                self.window = window
+                self._prefix_handlers = {
+                    "DUNGEON_AI_HIT_ENTITY ": self.on_entity_hit,
+                }
+
+            def send(self, _message):
+                return None
+
+            def on_entity_hit(self, hit):
+                self.window.register_hit(hit)
+
+        app = FakeApp(host)
+        host._send_fn = app.send
+        original_handler = app._prefix_handlers["DUNGEON_AI_HIT_ENTITY "]
+        state = self.module._DamageState(SimpleNamespace(logger=self.logger))
+        try:
+            state.install(host, None)
+            with patch.object(self.module.time, "monotonic", return_value=100.0):
+                app._prefix_handlers["DUNGEON_AI_HIT_ENTITY "]({
+                    "entity_id": 7,
+                    "target_id": 7,
+                    "damage": 45.0,
+                    "damage_type": "kinetic",
+                })
+            self.assertEqual(
+                "DUNGEON_AI_HIT_ENTITY ",
+                state.pending_hits[0]["channel"],
+            )
+            self.assertIsNone(state._attacker_id(state.pending_hits[0]["hit"]))
+        finally:
+            state.uninstall()
+
+        self.assertIs(
+            original_handler,
+            app._prefix_handlers["DUNGEON_AI_HIT_ENTITY "],
+        )
+
+    def test_protocol_diagnostic_captures_packet_shapes_and_restores_route(self):
+        base = host_with_shields(100.0)
+        host = HookHost()
+        host.__dict__.update(vars(base))
+        host._find_my_entity = lambda: host._local_entity
+        host.original_hits = []
+        host.original_asteroid_hits = []
+        host.original_beams = []
+
+        class FakeApp:
+            def __init__(self):
+                self._prefix_handlers = {
+                    "DUNGEON_AI_HIT_ENTITY ": self.on_entity_hit,
+                }
+                self.routed = []
+
+            def send(self, _message):
+                return None
+
+            def on_entity_hit(self, _hit):
+                return None
+
+            def _route_game_line(self, line, arrival_time=None):
+                self.routed.append((line, arrival_time))
+                return "routed"
+
+        app = FakeApp()
+        host._send_fn = app.send
+        original_route = app._route_game_line
+        state = self.module._DamageState(
+            SimpleNamespace(logger=self.logger))
+        try:
+            state.install(host, None)
+            self.assertIsNot(app._route_game_line, original_route)
+            self.assertEqual(
+                "routed",
+                app._route_game_line(
+                    'DUNGEON_AI_EFFECT {"effect_id":"burn-1","stack_count":2}',
+                    12.5),
+            )
+            app._route_game_line(
+                'DUNGEON_AI_EFFECT {"effect_id":"burn-2","stack_count":3}',
+                12.6)
+            app._route_game_line(
+                'DUNGEON_AI_HIT_ENTITY {"damage":45,"entity_id":"7"}',
+                12.7)
+            self.assertEqual(3, len(app.routed))
+            captures = [
+                call.args for call in self.logger.debug.call_args_list
+                if call.args and call.args[0].startswith(
+                    "DAMAGE_PROTOCOL_CAPTURE token=")
+            ]
+            self.assertEqual(2, len(captures))
+            self.assertEqual(
+                ("DUNGEON_AI_EFFECT", False, "object",
+                 ("effect_id", "stack_count"), ()),
+                captures[0][1:],
+            )
+            self.assertEqual(
+                ("DUNGEON_AI_HIT_ENTITY", True, "object",
+                 ("damage", "entity_id"), ()),
+                captures[1][1:],
+            )
+        finally:
+            state.uninstall()
+
+        self.assertNotIn("_route_game_line", vars(app))
+        self.assertIs(app._route_game_line.__func__, original_route.__func__)
+        self.assertIs(app._route_game_line.__self__, app)
+
+    def test_raw_turret_projectile_metadata_survives_vanilla_reduction(self):
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 2,
+                "weapon_type": "patriot_beam",
+                "effective_damage": 5621.6,
+                "weapon_def": {
+                    "display_name": "Patriot Beam",
+                    "damage_type": "kinetic",
+                },
+            }],
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state._remember_projectile_payload({"s": [{
+                "id": "turret-round",
+                "owner_id": 99,
+                "is_turret": True,
+                "hardpoint_index": 2,
+                "weapon": "Patriot Beam",
+            }]}, "player")
+            self.host._proj_interp = {
+                "turret-round": {
+                    "owner_id": 99,
+                    "x": -40.0, "y": 20.0,
+                    "vx": 500.0, "vy": 0.0, "radius": 3.0,
+                },
+            }
+            self.state.snapshot(self.host)
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 5621.6,
+                 "damage_type": "kinetic"},
+                channel="DUNGEON_AI_HIT_ENTITY ",
+            )
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        self.assertEqual(
+            "Patriot Beam",
+            self.state.window_snapshot()["feed"][0]["weapon"],
+        )
+
+    def test_owned_unnamed_projectile_records_unknown_weapon(self):
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.record_ship_hit(
+                self.host, {"target_id": 7, "damage": 12.0})
+
+        self.host._proj_interp = {
+            "unnamed-owned-round": {
+                "owner_id": 99,
+                "x": -40.0,
+                "y": 20.0,
+                "vx": 500.0,
+                "vy": 0.0,
+                "radius": 3.0,
+            },
+        }
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        feed = self.state.window_snapshot()["feed"]
+        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+        self.assertEqual("Unknown", feed[0]["weapon"])
 
     def test_active_fire_does_not_claim_a_different_target(self):
         self.host._targeted_npc_id = "npc-raider"
@@ -483,13 +1346,27 @@ class DamageNumberTests(unittest.TestCase):
             "oy": 0.0,
             "ex": 10.0,
             "ey": 20.0,
+            "hardpoint_index": 2,
         }, 100.0)]
+        self.host._turret_state = {
+            "hardpoints": [{
+                "index": 2,
+                "weapon_type": "blaze_cannon",
+                "weapon_def": {"display_name": "Blaze Cannon"},
+            }],
+        }
 
         with patch.object(self.module.time, "monotonic", return_value=100.1):
             self.state.record_ship_hit(
                 self.host, {"target_id": 7, "damage": 12.0})
+        with patch.object(self.module.time, "monotonic", return_value=100.16):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.28):
+            self.state.snapshot(self.host)
 
-        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+        snapshot = self.state.window_snapshot()
+        self.assertEqual(12.0, snapshot["dealt_total"])
+        self.assertEqual("Blaze Cannon", snapshot["feed"][0]["weapon"])
 
     def test_local_projectile_counts_after_it_leaves_client_snapshot(self):
         self.host._proj_interp = {
@@ -500,6 +1377,7 @@ class DamageNumberTests(unittest.TestCase):
                 "vx": 500.0,
                 "vy": 0.0,
                 "radius": 3.0,
+                "weapon": "Patriot Beam",
             },
         }
         with patch.object(self.module.time, "monotonic", return_value=100.0):
@@ -509,13 +1387,86 @@ class DamageNumberTests(unittest.TestCase):
         with patch.object(self.module.time, "monotonic", return_value=100.1):
             self.state.record_ship_hit(
                 self.host, {"target_id": 7, "damage": 12.0})
+        with patch.object(self.module.time, "monotonic", return_value=100.16):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.28):
+            self.state.snapshot(self.host)
 
-        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+        snapshot = self.state.window_snapshot()
+        self.assertEqual(12.0, snapshot["dealt_total"])
+        self.assertEqual("Patriot Beam", snapshot["feed"][0]["weapon"])
+
+    def test_projectile_label_is_not_reused_for_a_later_hit(self):
+        self.host._proj_interp = {
+            "kraken-round": {
+                "owner_id": 99,
+                "x": -40.0,
+                "y": 20.0,
+                "vx": 500.0,
+                "vy": 0.0,
+                "radius": 3.0,
+                "weapon": "Kraken's Tooth",
+            },
+        }
+
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 12.0})
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.19):
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "attacker_id": 99, "damage": 8.0})
+
+        feed = self.state.window_snapshot()["feed"]
+        self.assertEqual("Kraken's Tooth", feed[0]["weapon"])
+        self.assertEqual("Unknown", feed[1]["weapon"])
+
+    def test_closest_projectile_wins_over_a_nearby_stale_round(self):
+        self.host._proj_interp = {
+            "older-kraken": {
+                "owner_id": 99,
+                "x": -5.0,
+                "y": 35.0,
+                "vx": 0.0,
+                "vy": 0.0,
+                "radius": 3.0,
+                "weapon": "Kraken's Tooth",
+            },
+            "closest-patriot": {
+                "owner_id": 99,
+                "x": 0.0,
+                "y": 20.0,
+                "vx": 500.0,
+                "vy": 0.0,
+                "radius": 3.0,
+                "weapon": "Patriot Beam",
+            },
+        }
+
+        with patch.object(self.module.time, "monotonic", return_value=100.0):
+            self.state.snapshot(self.host)
+            self.state.record_ship_hit(
+                self.host,
+                {"target_id": 7, "damage": 12.0})
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
+
+        self.assertEqual(
+            "Patriot Beam", self.state.window_snapshot()["feed"][0]["weapon"])
 
     def test_player_owned_fighter_projectile_counts_as_dealt(self):
         self.host._npc_entities["fighter-alpha"] = {
             "display_name": "My Fighter",
-            "owner_id": 99,
+            "fighter_owner_id": 99,
+            "active_weapon_name": "Fighter Pulse Laser",
             "x": 0.0,
             "y": 0.0,
         }
@@ -534,8 +1485,14 @@ class DamageNumberTests(unittest.TestCase):
             self.state.snapshot(self.host)
             self.state.record_ship_hit(
                 self.host, {"target_id": 7, "damage": 12.0})
+        with patch.object(self.module.time, "monotonic", return_value=100.06):
+            self.state.snapshot(self.host)
+        with patch.object(self.module.time, "monotonic", return_value=100.18):
+            self.state.snapshot(self.host)
 
-        self.assertEqual(12.0, self.state.window_snapshot()["dealt_total"])
+        snapshot = self.state.window_snapshot()
+        self.assertEqual(12.0, snapshot["dealt_total"])
+        self.assertEqual("Fighter Pulse Laser", snapshot["feed"][0]["weapon"])
 
     def test_other_players_projectile_near_target_is_ignored(self):
         self.host._proj_interp = {
@@ -617,7 +1574,8 @@ class DamageNumberTests(unittest.TestCase):
         self.host._npc_entities = {
             "drone-alpha": {
                 "display_name": "My Drone",
-                "owner_id": 99,
+                "drone_owner_id": 99,
+                "active_weapon_name": "Guardian Laser",
                 "x": 5.0,
                 "y": 6.0,
             },
@@ -631,6 +1589,7 @@ class DamageNumberTests(unittest.TestCase):
         snapshot = self.state.window_snapshot()
         self.assertEqual(12.0, snapshot["dealt_total"])
         self.assertEqual("dealt", snapshot["feed"][0]["direction"])
+        self.assertEqual("Guardian Laser", snapshot["feed"][0]["weapon"])
 
     def test_local_target_without_attacker_is_still_received(self):
         self.state.record_ship_hit(
