@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5
+
+- Added compatibility with Star Empire 0.4.95.
+- Improved weapon attribution for your main weapons, turrets, owned drones and
+  fighters, including combat that continues while the main weapon is idle.
+- Added conservative handling for fire-cannon residual damage. Matching rows
+  are marked `Possible Burn` first, then `Burn` once a steady pattern is seen.
+  Source-free hits that cannot be identified safely remain `Unknown`.
+
 ## v0.4
 
 - Added compatibility with Star Empire 0.4.94.

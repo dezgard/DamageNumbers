@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
+import types
 from collections import deque
 from typing import Any
 
@@ -28,6 +30,20 @@ _DAMAGE_TYPE_COLOURS = {
     "Unknown": (126, 140, 154),
 }
 
+_PROTOCOL_DIAGNOSTIC_TOKENS = frozenset((
+    "DUNGEON_FRAME",
+    "DUNGEON_AI_STATE",
+    "DUNGEON_AI_JOINED",
+    "DUNGEON_AI_PROJECTILES",
+    "DUNGEON_AI_FIRE",
+    "DUNGEON_AI_BEAM",
+    "DUNGEON_AI_HIT",
+    "DUNGEON_AI_HIT_ENTITY",
+))
+_PROTOCOL_DIAGNOSTIC_KEYWORDS = (
+    "DOT", "BURN", "EFFECT", "STATUS",
+)
+
 
 class _DamageState:
     def __init__(self, api: Any) -> None:
@@ -41,6 +57,12 @@ class _DamageState:
         self.original_asteroid_hit = None
         self.hit_wrapper = None
         self.asteroid_wrapper = None
+        self.original_event_methods = {}
+        self.event_wrappers = {}
+        self.protocol_context = threading.local()
+        self.protocol_handler_entries = {}
+        self.protocol_route_entry = None
+        self.protocol_packet_shapes = set()
         self.lifetime = 1.2
         self.rise = 46.0
         self.limit = 40
@@ -97,8 +119,37 @@ class _DamageState:
         self.fire_intents = []
         self.fire_intent_grace = 2.0
         self.weapon_tracks = {}
-        self.weapon_target_intents = []
-        self.weapon_track_grace = 0.75
+        self.projectile_payload_metadata = {}
+        self.consumed_weapon_tracks = {}
+        # Projectile IDs are only trusted at the impact moment.  A larger
+        # window lets a prior slow round name a later rapid-fire hit.
+        # Retain the last correction through the 160 ms hit batch. Candidate
+        # acceptance still uses the hit's own much tighter impact-time window.
+        self.weapon_track_grace = 0.45
+        self.pending_hits = deque()
+        # Hold a compact target-local batch long enough for the hit packet and
+        # its visual event to arrive in either order.  The live client can put a
+        # burn tick about 90 ms ahead of the direct shot in the same update.
+        self.pending_hit_grace = 0.16
+        self.pending_batch_span = 0.14
+        self.pending_hit_timeout = 0.45
+        self.pending_hit_limit = 256
+        self.pending_attempt_limit = 32
+        self.beam_evidence = deque(maxlen=256)
+        self.consumed_beam_evidence = {}
+        self.beam_evidence_sequence = 0
+        self.beam_evidence_grace = 0.35
+        # Direct hits and residual effects are different evidence streams.
+        # A source stays alive while a confirmed periodic effect is still
+        # arriving, without consuming an unrelated projectile or beam.
+        self.effect_sources = deque(maxlen=32)
+        self.effect_source_lifetime = 8.0
+        self.effect_source_reset_gap = 2.0
+        self.effect_source_min_delay = 0.20
+        self.effect_source_max_fraction = 0.20
+        self.effect_source_batch_span = 0.16
+        self.effect_source_tick_idle_timeout = 2.25
+        self.effect_source_max_stacks = 12
 
     @staticmethod
     def _empty_direction_stats() -> dict:
@@ -227,6 +278,61 @@ class _DamageState:
         value = str(hit.get("damage_type", "")).strip().casefold()
         return _DAMAGE_TYPE_LABELS.get(value, "Unknown")
 
+    @staticmethod
+    def _report_damage_type(
+            server_damage_type: str, attribution: dict | None) -> str:
+        """Use a readable burn label while retaining the packet value."""
+        if (isinstance(attribution, dict)
+                and attribution.get("effect_kind") in (
+                    "burn", "possible_burn")):
+            return "Fires"
+        return server_damage_type
+
+    @staticmethod
+    def _weapon_label(event: dict) -> str:
+        """Return a supplied weapon name without guessing from the damage type."""
+        for field in ("weapon_name", "weapon", "weapon_type", "source_weapon"):
+            value = event.get(field)
+            if isinstance(value, (dict, list, tuple, set)) or value is None:
+                continue
+            label = str(value).strip()
+            if label:
+                if "_" in label:
+                    label = label.replace("_", " ").title()
+                return label
+        return "Unknown"
+
+    @staticmethod
+    def _known_weapon_label(label: str | None) -> bool:
+        return bool(label and label not in ("Unknown", "—", "-"))
+
+    @classmethod
+    def _best_weapon_label(cls, *labels: str | None) -> str:
+        for label in labels:
+            if cls._known_weapon_label(label):
+                return str(label)
+        return "Unknown"
+
+    def _entity_weapon_label(self, host: Any, entity_id: Any) -> str:
+        """Return a cached active weapon name for the local ship or an entity."""
+        row = None
+        if self._same_id(entity_id, self._local_player_id(host)):
+            finder = getattr(host, "_find_my_entity", None)
+            try:
+                candidate = finder() if callable(finder) else None
+                row = candidate if isinstance(candidate, dict) else None
+            except Exception:
+                row = None
+        if row is None:
+            row = self._entity(host, entity_id)
+        if not isinstance(row, dict):
+            return "Unknown"
+        value = row.get("active_weapon_name")
+        if isinstance(value, (dict, list, tuple, set)) or value is None:
+            return "Unknown"
+        label = str(value).strip()
+        return label if self._known_weapon_label(label) else "Unknown"
+
     def _observe_energy(self, host: Any) -> None:
         """Track ship-wide energy spent between authoritative entity updates."""
         finder = getattr(host, "_find_my_entity", None)
@@ -353,30 +459,31 @@ class _DamageState:
         target_id = self._selected_target_id(host)
         if not firing or target_id is None:
             return
+        weapon = self._entity_weapon_label(host, self._local_player_id(host))
         now = time.monotonic()
         expires = now + self.fire_intent_grace
         with self.lock:
             retained = [
-                (known_target, known_expiry)
-                for known_target, known_expiry in self.fire_intents
+                (known_target, known_expiry, known_weapon)
+                for known_target, known_expiry, known_weapon in self.fire_intents
                 if known_expiry >= now
                 and not self._matching_id(known_target, target_id)
             ]
-            retained.append((target_id, expires))
+            retained.append((target_id, expires, weapon))
             self.fire_intents = retained[-8:]
 
-    def _recent_local_fire_at(self, target_id: Any) -> bool:
+    def _recent_local_fire_at(self, target_id: Any) -> str | None:
         now = time.monotonic()
         with self.lock:
             self.fire_intents = [
-                (known_target, expiry)
-                for known_target, expiry in self.fire_intents
+                (known_target, expiry, weapon)
+                for known_target, expiry, weapon in self.fire_intents
                 if expiry >= now
             ]
-            return any(
-                self._matching_id(known_target, target_id)
-                for known_target, _expiry in self.fire_intents
-            )
+            for known_target, _expiry, weapon in self.fire_intents:
+                if self._matching_id(known_target, target_id):
+                    return weapon
+        return None
 
     @staticmethod
     def _point_segment_distance(
@@ -414,12 +521,48 @@ class _DamageState:
                     self._same_id(row.get(field), local_id)
                     for field in (
                         "owner_id", "player_id", "drone_owner_id",
-                        "rc_owner_id", "source_owner_id")):
+                        "fighter_owner_id", "rc_owner_id", "source_owner_id")):
                 continue
             tokens.update(self._id_tokens(entity_key))
             for field in ("id", "entity_id", "npc_id", "player_id"):
                 tokens.update(self._id_tokens(row.get(field)))
         return tokens
+
+    def _remember_projectile_payload(
+            self, payload: Any, stream_name: str) -> None:
+        """Keep full spawn metadata before the vanilla cache narrows each row."""
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict):
+            rows = payload.get("s", ())
+        else:
+            rows = ()
+        if not isinstance(rows, (list, tuple)):
+            return
+        now = time.monotonic()
+        with self.lock:
+            for row in rows:
+                if not isinstance(row, dict) or row.get("id") is None:
+                    continue
+                track_id = stream_name + ":" + str(row["id"])
+                previous = self.projectile_payload_metadata.get(track_id)
+                merged = (
+                    dict(previous["row"])
+                    if isinstance(previous, dict)
+                    and isinstance(previous.get("row"), dict)
+                    else {}
+                )
+                merged.update(row)
+                self.projectile_payload_metadata[track_id] = {
+                    "row": merged,
+                    "observed_at": now,
+                }
+            self.projectile_payload_metadata = {
+                track_id: metadata
+                for track_id, metadata
+                in self.projectile_payload_metadata.items()
+                if now - float(metadata["observed_at"]) <= 1.0
+            }
 
     def _observe_owned_projectiles(self, host: Any) -> None:
         now = time.monotonic()
@@ -439,14 +582,41 @@ class _DamageState:
 
         local_id = self._local_player_id(host)
         owner_tokens = self._local_owner_tokens(local_id, entity_rows)
+        with self.lock:
+            raw_metadata = {
+                track_id: dict(metadata.get("row", {}))
+                for track_id, metadata
+                in self.projectile_payload_metadata.items()
+            }
         observed = []
         for stream_name, projectiles in streams:
             for projectile_id, row in projectiles.items():
                 if not isinstance(row, dict):
                     continue
-                owner_id = self._attacker_id(row)
+                track_id = stream_name + ":" + str(projectile_id)
+                evidence_row = dict(raw_metadata.get(track_id, {}))
+                evidence_row.update(row)
+                for field in (
+                        "weapon_name", "weapon", "weapon_type",
+                        "source_weapon", "hardpoint_index", "turret_index"):
+                    if evidence_row.get(field) in (None, ""):
+                        raw_value = raw_metadata.get(track_id, {}).get(field)
+                        if raw_value not in (None, ""):
+                            evidence_row[field] = raw_value
+                owner_id = self._attacker_id(evidence_row)
                 if not self._id_tokens(owner_id).intersection(owner_tokens):
                     continue
+                is_turret = bool(evidence_row.get("is_turret"))
+                weapon = self._weapon_label(evidence_row)
+                if not self._known_weapon_label(weapon):
+                    if is_turret:
+                        weapon = self._turret_weapon_label(
+                            host, evidence_row)
+                    elif not self._same_id(owner_id, local_id):
+                        # Drones and fighters have a stable entity weapon.
+                        # The local ship does not: its value is merely the last
+                        # selected main weapon and cannot name a turret round.
+                        weapon = self._entity_weapon_label(host, owner_id)
                 try:
                     x = float(row["x"])
                     y = float(row["y"])
@@ -458,30 +628,49 @@ class _DamageState:
                 observed.append((
                     stream_name + ":" + str(projectile_id),
                     x, y, vx, vy, radius, owner_id,
-                    self._target_hint(row),
+                    self._target_hint(evidence_row), weapon, is_turret,
+                    self._event_is_dot_capable(
+                        host, evidence_row, weapon, "_projectiles"),
+                    dict(evidence_row),
                 ))
 
         with self.lock:
+            self.consumed_weapon_tracks = {
+                track_id: expiry
+                for track_id, expiry in self.consumed_weapon_tracks.items()
+                if expiry >= now
+            }
             for (track_id, x, y, vx, vy, radius, owner_id,
-                 target_hint) in observed:
+                 target_hint, weapon, is_turret, dot_capable,
+                 evidence_row) in observed:
+                if track_id in self.consumed_weapon_tracks:
+                    continue
                 previous = self.weapon_tracks.get(track_id)
                 if previous is None:
                     previous_x, previous_y = x, y
+                    previous_seen = now
                 elif (x != previous["x"] or y != previous["y"]):
                     previous_x, previous_y = previous["x"], previous["y"]
+                    previous_seen = previous["last_seen"]
                 else:
                     previous_x = previous["previous_x"]
                     previous_y = previous["previous_y"]
+                    previous_seen = previous["previous_seen"]
                 self.weapon_tracks[track_id] = {
                     "x": x,
                     "y": y,
                     "previous_x": previous_x,
                     "previous_y": previous_y,
+                    "previous_seen": previous_seen,
                     "vx": vx,
                     "vy": vy,
                     "radius": radius,
                     "owner_id": owner_id,
                     "target_hint": target_hint,
+                    "weapon": weapon,
+                    "is_turret": is_turret,
+                    "dot_capable": dot_capable,
+                    "evidence": evidence_row,
                     "last_seen": now,
                 }
             self.weapon_tracks = {
@@ -489,6 +678,17 @@ class _DamageState:
                 for track_id, track in self.weapon_tracks.items()
                 if now - track["last_seen"] <= self.weapon_track_grace
             }
+
+    def _claim_weapon_track(self, track_id: str, now: float) -> bool:
+        """Allow one projectile snapshot to name one matching damage event."""
+        with self.lock:
+            expiry = self.consumed_weapon_tracks.get(track_id)
+            if expiry is not None and expiry >= now:
+                return False
+            self.weapon_tracks.pop(track_id, None)
+            self.consumed_weapon_tracks[track_id] = (
+                now + self.weapon_track_grace)
+            return True
 
     def _target_geometry(
             self, host: Any,
@@ -507,7 +707,7 @@ class _DamageState:
             1.0, default_radius if radius is None else radius)
 
     @staticmethod
-    def _beam_entries(host: Any) -> tuple[tuple[dict, float], ...]:
+    def _beam_entries(host: Any) -> tuple[tuple[str, dict, float], ...]:
         entries = []
         for field, lock_field in (
                 ("_beams", "_beams_lock"),
@@ -531,54 +731,393 @@ class _DamageState:
                 else:
                     continue
                 try:
-                    entries.append((beam, float(born_at)))
+                    entries.append((field, beam, float(born_at)))
                 except (TypeError, ValueError):
                     continue
         return tuple(entries)
 
-    def _recent_owned_beam_at(self, host: Any, target_id: Any) -> bool:
+    def _remember_beam_event(
+            self, source: str, beam: Any,
+            born_at: float | None = None) -> None:
+        if not isinstance(beam, dict):
+            return
+        captured = dict(beam)
+        host = self.host
+        if (source == "_beams" and host is not None
+                and self._same_id(
+                    self._attacker_id(captured),
+                    self._local_player_id(host))):
+            # The ordinary local beam stream does not carry a weapon name.
+            # Preserve the selected weapon at fire time so a later selection
+            # change cannot relabel this specific beam.
+            weapon = self._entity_weapon_label(
+                host, self._local_player_id(host))
+            if self._known_weapon_label(weapon):
+                captured["_damage_numbers_local_weapon"] = weapon
+        observed_at = time.monotonic() if born_at is None else float(born_at)
+        with self.lock:
+            self.beam_evidence_sequence += 1
+            evidence_id = ("captured", self.beam_evidence_sequence)
+            self.beam_evidence.append(
+                (source, captured, observed_at, evidence_id))
+
+    def _cached_beam_entries(self, now: float) -> tuple:
+        with self.lock:
+            retained = [
+                entry for entry in self.beam_evidence
+                if -0.1 <= now - entry[2] <= self.beam_evidence_grace
+            ]
+            self.beam_evidence = deque(retained, maxlen=256)
+            self.consumed_beam_evidence = {
+                key: expiry
+                for key, expiry in self.consumed_beam_evidence.items()
+                if expiry >= now
+            }
+            return tuple(retained)
+
+    def _claim_beam_evidence(self, evidence_id: Any, now: float) -> bool:
+        with self.lock:
+            expiry = self.consumed_beam_evidence.get(evidence_id)
+            if expiry is not None and expiry >= now:
+                return False
+            self.consumed_beam_evidence[evidence_id] = (
+                now + self.beam_evidence_grace)
+            return True
+
+    def _turret_hardpoints(
+            self, host: Any, event: dict) -> tuple[dict, ...]:
+        """Return the fitted hardpoints that can have produced an event."""
+        state = getattr(host, "_turret_state", None)
+        hardpoints = state.get("hardpoints") if isinstance(state, dict) else None
+        if not isinstance(hardpoints, (list, tuple)):
+            return ()
+        hardpoint_index = None
+        for field in ("hardpoint_index", "turret_index"):
+            value = event.get(field)
+            if value is not None:
+                hardpoint_index = value
+                break
+
+        candidates = []
+        for ordinal, hardpoint in enumerate(hardpoints):
+            if not isinstance(hardpoint, dict) or not hardpoint.get("weapon_type"):
+                continue
+            if hardpoint_index is None:
+                candidates.append(hardpoint)
+                continue
+            if self._same_id(hardpoint.get("index", ordinal), hardpoint_index):
+                candidates = [hardpoint]
+                break
+        return tuple(candidates)
+
+    def _hardpoint_weapon_label(self, hardpoint: dict) -> str:
+        definition = hardpoint.get("weapon_def")
+        if isinstance(definition, dict):
+            return self._weapon_label({
+                "weapon_name": definition.get("display_name"),
+                "weapon_type": hardpoint.get("weapon_type"),
+            })
+        return self._weapon_label(hardpoint)
+
+    def _hardpoint_damage_type(self, hardpoint: dict) -> str:
+        definition = hardpoint.get("weapon_def")
+        rows = (hardpoint, definition) if isinstance(definition, dict) else (hardpoint,)
+        for row in rows:
+            label = self._damage_type_label(row)
+            if label != "Unknown":
+                return label
+        return "Unknown"
+
+    def _hardpoint_expected_damage(self, hardpoint: dict) -> float | None:
+        definition = hardpoint.get("weapon_def")
+        rows = (hardpoint, definition) if isinstance(definition, dict) else (hardpoint,)
+        for row in rows:
+            for field in ("effective_damage", "damage", "base_damage"):
+                value = self._number(row, field)
+                if value is not None and value > 0.0:
+                    return value
+        return None
+
+    def _compatible_hardpoints_for_hit(
+            self, hardpoints: tuple[dict, ...] | list[dict],
+            hit: dict) -> tuple[tuple[dict, ...], bool]:
+        """Narrow anonymous turrets by type, never by applied damage.
+
+        The hit amount is post-mitigation and can legitimately approach zero.
+        If several fitted turret names share a type, the caller leaves the
+        result unknown instead of guessing from their raw weapon damage.
+        """
+        hit_type = self._damage_type_label(hit)
+        signature_known = False
+        compatible = []
+        for hardpoint in hardpoints:
+            damage_type = self._hardpoint_damage_type(hardpoint)
+            signature_known = signature_known or damage_type != "Unknown"
+            if (hit_type != "Unknown" and damage_type != "Unknown"
+                    and hit_type != damage_type):
+                continue
+            compatible.append(hardpoint)
+        return tuple(compatible), signature_known
+
+    def _turret_weapon_evidence(
+            self, host: Any, event: dict,
+            hit: dict | None = None) -> dict | None:
+        """Resolve a turret without ever consulting the selected main weapon."""
+        supplied = self._weapon_label(event)
+        candidates = self._turret_hardpoints(host, event)
+        has_exact_index = any(
+            event.get(field) is not None
+            for field in ("hardpoint_index", "turret_index")
+        )
+        if not candidates:
+            return (
+                {"weapon": supplied, "hardpoints": ()}
+                if self._known_weapon_label(supplied) else None
+            )
+
+        if self._known_weapon_label(supplied):
+            named = tuple(
+                hardpoint for hardpoint in candidates
+                if self._hardpoint_weapon_label(hardpoint).casefold()
+                == supplied.casefold()
+            )
+            # A supplied weapon is direct event evidence.  Applied damage can
+            # differ substantially after resistance, flat mitigation or crits.
+            return {
+                "weapon": supplied,
+                "hardpoints": named or candidates,
+            }
+
+        if has_exact_index:
+            labels = {
+                self._hardpoint_weapon_label(hardpoint)
+                for hardpoint in candidates
+            }
+            labels.discard("Unknown")
+            if len(labels) == 1:
+                return {
+                    "weapon": labels.pop(),
+                    "hardpoints": candidates,
+                }
+            return None
+
+        usable = list(candidates)
+        if isinstance(hit, dict):
+            compatible, signature_known = (
+                self._compatible_hardpoints_for_hit(candidates, hit))
+            if compatible:
+                usable = list(compatible)
+            elif signature_known:
+                # A source-free 45/90 burn tick must not spend a nearby
+                # 5,622-damage Patriot beam merely because its timing overlaps.
+                return None
+
+        labels = {
+            self._hardpoint_weapon_label(hardpoint)
+            for hardpoint in usable
+        }
+        labels.discard("Unknown")
+        if len(labels) != 1:
+            return None
+        return {"weapon": labels.pop(), "hardpoints": tuple(usable)}
+
+    def _turret_weapon_label(self, host: Any, event: dict) -> str:
+        """Resolve a nameless turret event through its reported hardpoint."""
+        evidence = self._turret_weapon_evidence(host, event)
+        return "Unknown" if evidence is None else str(evidence["weapon"])
+
+    @staticmethod
+    def _truthy_effect_value(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return math.isfinite(float(value)) and float(value) > 0.0
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            return False
+        return str(value).strip().casefold() not in ("", "0", "false", "none")
+
+    def _event_is_dot_capable(
+            self, host: Any, event: dict,
+            weapon: str, source: str = "") -> bool:
+        """Recognise explicit burn metadata, with a narrow name fallback."""
+        rows = [event]
+        if source == "_turret_beams" or bool(event.get("is_turret")):
+            for hardpoint in self._turret_hardpoints(host, event):
+                label = self._hardpoint_weapon_label(hardpoint)
+                if (self._known_weapon_label(weapon)
+                        and self._known_weapon_label(label)
+                        and label != weapon):
+                    continue
+                rows.append(hardpoint)
+                definition = hardpoint.get("weapon_def")
+                if isinstance(definition, dict):
+                    rows.append(definition)
+        marker_fields = (
+            "is_dot", "applies_dot", "damage_over_time", "dot_damage",
+            "dot_dps", "dot_hits", "dot_duration", "burn_damage",
+            "burn_dps", "burn_ticks", "burn_duration", "ignites",
+            "ignite_chance", "sets_on_fire",
+        )
+        for row in rows:
+            if any(
+                    field in row
+                    and self._truthy_effect_value(row.get(field))
+                    for field in marker_fields):
+                return True
+        text = " ".join(
+            str(value)
+            for row in rows
+            for field in (
+                "display_name", "name", "description",
+                "effect_name", "extra_effect_name")
+            for value in (row.get(field),)
+            if value is not None
+        )
+        text = (str(weapon or "") + " " + text).casefold()
+        return any(marker in text for marker in (
+            "blaze", "inferno", "flame", "incendiary",
+            "fire cannon", "sets targets alight", "burning", "burn damage",
+        ))
+
+    def _owned_beam_candidates(
+            self, host: Any, target_id: Any,
+            event_at: float, hit: dict) -> list[dict]:
         geometry = self._target_geometry(host, target_id)
         if geometry is None:
-            return False
+            return []
         target_x, target_y, target_radius = geometry
         now = time.monotonic()
-        for beam, born_at in self._beam_entries(host):
-            age = now - born_at
-            if age < -0.1 or age > self.weapon_track_grace:
+        cached = self._cached_beam_entries(now)
+        hooked_sources = {
+            source for method_name, source in (
+                ("add_beam", "_beams"),
+                ("add_turret_beam", "_turret_beams"),
+                ("add_station_beam", "_station_beams"))
+            if method_name in self.event_wrappers
+        }
+        live = tuple(
+            (source, beam, born_at,
+             ("live", source, id(beam), round(born_at, 6)))
+            for source, beam, born_at in self._beam_entries(host)
+            if source not in hooked_sources
+        )
+        candidates = []
+        for source, beam, born_at, evidence_id in cached + live:
+            delta = float(event_at) - born_at
+            if delta < -0.08 or delta > 0.30:
                 continue
+            with self.lock:
+                if self.consumed_beam_evidence.get(evidence_id, -1.0) >= now:
+                    continue
             owner_id = self._attacker_id(beam)
             if not self._owned_by_player(host, owner_id):
                 continue
+            weapon = self._weapon_label(beam)
+            if (source == "_beams"
+                    and self._same_id(
+                        owner_id, self._local_player_id(host))):
+                captured_weapon = beam.get("_damage_numbers_local_weapon")
+                if isinstance(captured_weapon, str):
+                    weapon = self._best_weapon_label(
+                        weapon, captured_weapon.strip())
+            if source == "_turret_beams":
+                # A turret event belongs to its hardpoint, never to the local
+                # ship's currently selected main weapon.
+                turret_evidence = self._turret_weapon_evidence(
+                    host, beam, hit)
+                if turret_evidence is None:
+                    continue
+                weapon = str(turret_evidence["weapon"])
+            elif (not self._known_weapon_label(weapon)
+                  and not self._same_id(
+                      owner_id, self._local_player_id(host))):
+                weapon = self._entity_weapon_label(host, owner_id)
+            dot_capable = self._event_is_dot_capable(
+                host, beam, weapon, source)
             target_hint = self._target_hint(beam)
             if self._matching_id(target_hint, target_id):
-                return True
+                candidates.append({
+                    "score": abs(delta) * 3.0,
+                    "observed_at": born_at,
+                    "evidence_kind": "beam",
+                    "evidence_id": evidence_id,
+                    "weapon": weapon,
+                    "dot_capable": dot_capable,
+                })
+                continue
             try:
                 end_x = float(beam["ex"])
                 end_y = float(beam["ey"])
             except (KeyError, TypeError, ValueError):
                 continue
             padding = max(14.0, target_radius * 0.35)
-            if math.hypot(end_x - target_x, end_y - target_y) <= (
-                    target_radius + padding):
-                return True
-        return False
+            endpoint_distance = math.hypot(
+                end_x - target_x, end_y - target_y)
+            if endpoint_distance <= target_radius + padding:
+                score = (endpoint_distance / max(target_radius + padding, 1.0)
+                         + abs(delta) * 3.0)
+                candidates.append({
+                    "score": score,
+                    "observed_at": born_at,
+                    "evidence_kind": "beam",
+                    "evidence_id": evidence_id,
+                    "weapon": weapon,
+                    "dot_capable": dot_capable,
+                })
+        return candidates
 
-    def _recent_owned_projectile_at(self, host: Any, target_id: Any) -> bool:
-        self._observe_owned_projectiles(host)
+    def _owned_projectile_candidates(
+            self, host: Any, target_id: Any,
+            event_at: float, hit: dict, *,
+            refresh_projectiles: bool = True) -> list[dict]:
+        if refresh_projectiles:
+            self._observe_owned_projectiles(host)
         geometry = self._target_geometry(host, target_id)
         if geometry is None:
-            return False
+            return []
         target_x, target_y, target_radius = geometry
         now = time.monotonic()
         with self.lock:
-            tracks = tuple(self.weapon_tracks.values())
-        for track in tracks:
-            age = now - track["last_seen"]
-            if age < -0.1 or age > self.weapon_track_grace:
+            tracks = tuple(self.weapon_tracks.items())
+        candidates = []
+        for track_id, track in tracks:
+            observed_at = min(
+                (float(track.get("last_seen", event_at)),
+                 float(track.get("previous_seen", event_at))),
+                key=lambda value: abs(float(event_at) - value),
+            )
+            delta = float(event_at) - observed_at
+            if delta < -0.12 or delta > 0.35:
                 continue
+            with self.lock:
+                if self.consumed_weapon_tracks.get(track_id, -1.0) >= now:
+                    continue
+            weapon = str(track.get("weapon") or "Unknown")
+            dot_capable = bool(track.get("dot_capable"))
+            if bool(track.get("is_turret")):
+                event = track.get("evidence")
+                event = event if isinstance(event, dict) else {}
+                turret_evidence = self._turret_weapon_evidence(
+                    host, event, hit)
+                if turret_evidence is None:
+                    continue
+                weapon = str(turret_evidence["weapon"])
+                dot_capable = self._event_is_dot_capable(
+                    host, event, weapon, "_projectiles")
             if self._matching_id(track["target_hint"], target_id):
-                return True
-            prediction = min(0.25, max(0.08, age))
+                candidates.append({
+                    "score": abs(delta) * 3.0,
+                    "observed_at": observed_at,
+                    "evidence_kind": "projectile",
+                    "evidence_id": track_id,
+                    "weapon": weapon,
+                    "dot_capable": dot_capable,
+                })
+                continue
+            # The client normally receives projectile corrections at 10 Hz.
+            # Only bridge a very short gap beyond the newest correction; a
+            # longer prediction can catch a different weapon fired later.
+            prediction = 0.10
             end_x = track["x"] + track["vx"] * prediction
             end_y = track["y"] + track["vy"] * prediction
             distance = self._point_segment_distance(
@@ -586,33 +1125,314 @@ class _DamageState:
                 track["previous_x"], track["previous_y"],
                 end_x, end_y,
             )
-            tolerance = target_radius + track["radius"] + 18.0
-            if distance <= tolerance:
+            tolerance = (target_radius + track["radius"]
+                         + max(2.0, min(8.0, target_radius * 0.10)))
+            if distance > tolerance:
+                continue
+            start_distance = math.hypot(
+                track["previous_x"] - target_x,
+                track["previous_y"] - target_y)
+            end_distance = math.hypot(end_x - target_x, end_y - target_y)
+            current_distance = math.hypot(
+                track["x"] - target_x, track["y"] - target_y)
+            if (current_distance > tolerance
+                    and end_distance > start_distance
+                    + max(0.2, tolerance * 0.02)):
+                continue
+            score = (distance / tolerance
+                     + abs(delta) * 3.0
+                     + current_distance / max(tolerance * 8.0, 1.0))
+            candidates.append({
+                "score": score,
+                "observed_at": observed_at,
+                "evidence_kind": "projectile",
+                "evidence_id": track_id,
+                "weapon": weapon,
+                "dot_capable": dot_capable,
+            })
+        return candidates
+
+    def _owned_weapon_candidates(
+            self, host: Any, target_id: Any,
+            event_at: float, hit: dict, *,
+            refresh_projectiles: bool = True) -> list[dict]:
+        candidates = self._owned_beam_candidates(
+            host, target_id, event_at, hit)
+        candidates += self._owned_projectile_candidates(
+            host, target_id, event_at, hit,
+            refresh_projectiles=refresh_projectiles)
+        return candidates
+
+    def _recent_owned_weapon_at(
+            self, host: Any, target_id: Any,
+            event_at: float, hit: dict,
+            candidates: list[dict] | None = None) -> dict | None:
+        # Candidate collection is side-effect free. Only the single overall
+        # winner is claimed, so one hit cannot silently consume both a beam and
+        # a projectile that should identify the next hit.
+        if candidates is None:
+            candidates = self._owned_weapon_candidates(
+                host, target_id, event_at, hit)
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (
+                float(candidate["score"]),
+                abs(float(event_at) - float(candidate["observed_at"])),
+                -float(candidate["observed_at"]),
+            ),
+        )
+        now = time.monotonic()
+        for candidate in ordered:
+            if candidate["evidence_kind"] == "beam":
+                claimed = self._claim_beam_evidence(
+                    candidate["evidence_id"], now)
+            else:
+                claimed = self._claim_weapon_track(
+                    candidate["evidence_id"], now)
+            if claimed:
+                return candidate
+        return None
+
+    def _pending_direct_evidence_key(
+            self, item: dict, candidates: list[dict]) -> tuple:
+        """Order a hit by constrained, close visual evidence—not magnitude."""
+        hit = item["hit"]
+        unique_evidence = {
+            (candidate["evidence_kind"], str(candidate["evidence_id"]))
+            for candidate in candidates
+        }
+        if candidates:
+            best_score = min(float(candidate["score"])
+                             for candidate in candidates)
+            missing_evidence = 0
+            candidate_count = len(unique_evidence)
+        else:
+            best_score = float("inf")
+            missing_evidence = 1
+            candidate_count = 0
+        return (
+            self._hit_declares_dot(hit),
+            missing_evidence,
+            candidate_count,
+            best_score,
+            float(item["event_at"]),
+            -(self._damage(hit) or 0.0),
+        )
+
+    @staticmethod
+    def _hit_declares_dot(hit: dict) -> bool:
+        for field in (
+                "is_dot", "dot", "damage_over_time", "is_burn",
+                "burn", "periodic", "is_periodic"):
+            if field in hit and _DamageState._truthy_effect_value(
+                    hit.get(field)):
+                return True
+        for field in ("damage_kind", "effect_type", "effect", "hit_kind"):
+            value = str(hit.get(field, "")).strip().casefold()
+            if any(marker in value for marker in (
+                    "dot", "damage_over_time", "burn", "fire_tick",
+                "periodic")):
                 return True
         return False
 
-    def _recent_owned_weapon_at(self, host: Any, target_id: Any) -> bool:
-        now = time.monotonic()
+    @staticmethod
+    def _effect_source_activity_at(source: dict) -> float:
+        """Return the most recent direct hit or accepted residual tick."""
+        observed = []
+        for field in ("last_direct_at", "last_tick_at"):
+            value = source.get(field)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                observed.append(float(value))
+        return max(observed) if observed else -math.inf
+
+    def _remember_effect_source(
+            self, target_id: Any, attacker_id: Any,
+            match: dict, amount: float | None,
+            damage_type: str, event_at: float,
+            channel: str | None = None) -> None:
+        if (match.get("evidence_kind") not in ("beam", "projectile", "hit")
+                or not match.get("dot_capable")
+                or not self._known_weapon_label(match.get("weapon"))
+                or amount is None or amount <= 0.0):
+            return
+        weapon = str(match["weapon"])
+        current = float(event_at)
         with self.lock:
-            self.weapon_target_intents = [
-                (known_target, expiry)
-                for known_target, expiry in self.weapon_target_intents
-                if expiry >= now
-            ]
-            if any(
-                    self._matching_id(known_target, target_id)
-                    for known_target, _expiry in self.weapon_target_intents):
-                return True
-        matched = (
-            self._recent_owned_beam_at(host, target_id)
-            or self._recent_owned_projectile_at(host, target_id)
-        )
-        if matched:
-            with self.lock:
-                self.weapon_target_intents.append((
-                    target_id, now + self.weapon_track_grace))
-                self.weapon_target_intents = self.weapon_target_intents[-8:]
-        return matched
+            retained = deque(maxlen=self.effect_sources.maxlen)
+            updated = False
+            for source in self.effect_sources:
+                if float(source["expires_at"]) < current:
+                    continue
+                if (not updated
+                        and self._matching_id(
+                            source.get("target_id"), target_id)
+                        and source.get("weapon") == weapon
+                        and (channel is None
+                             or source.get("channel") is None
+                             or source.get("channel") == channel)):
+                    source = dict(source)
+                    previous_activity_at = self._effect_source_activity_at(
+                        source)
+                    source["attacker_id"] = attacker_id
+                    source["channel"] = channel
+                    source["last_direct_at"] = current
+                    source["expires_at"] = (
+                        current + self.effect_source_lifetime)
+                    if (current - previous_activity_at
+                            > self.effect_source_reset_gap):
+                        source["first_direct_at"] = current
+                        source["direct_damage"] = float(amount)
+                        source["tick_samples"] = []
+                        source["confirmed"] = False
+                        source["last_tick_at"] = None
+                        source["direct_batch_at"] = current
+                        source["direct_batch_count"] = 1
+                        source["stack_ceiling"] = 1
+                    else:
+                        prior = float(source.get("direct_damage", amount))
+                        source["direct_damage"] = min(prior, float(amount))
+                        batch_at = float(source.get("direct_batch_at", current))
+                        if 0.0 <= current - batch_at <= self.effect_source_batch_span:
+                            batch_count = int(
+                                source.get("direct_batch_count", 1)) + 1
+                        else:
+                            batch_at = current
+                            batch_count = 1
+                        source["direct_batch_at"] = batch_at
+                        source["direct_batch_count"] = batch_count
+                        source["stack_ceiling"] = max(
+                            int(source.get("stack_ceiling", 1)), batch_count)
+                    source["damage_type"] = damage_type
+                    updated = True
+                retained.append(source)
+            if not updated:
+                retained.append({
+                    "target_id": target_id,
+                    "attacker_id": attacker_id,
+                    "weapon": weapon,
+                    "damage_type": damage_type,
+                    "channel": channel,
+                    "direct_damage": float(amount),
+                    "first_direct_at": current,
+                    "last_direct_at": current,
+                    "expires_at": current + self.effect_source_lifetime,
+                    "tick_samples": [],
+                    "confirmed": False,
+                    "last_tick_at": None,
+                    "direct_batch_at": current,
+                    "direct_batch_count": 1,
+                    "stack_ceiling": 1,
+                })
+            self.effect_sources = retained
+
+    def _effect_candidate_limit(self, source: dict) -> float:
+        """Bound anonymous ticks by the observed simultaneous Blaze burst."""
+        direct_damage = float(source.get("direct_damage", 0.0))
+        stack_ceiling = max(1, min(
+            int(source.get("stack_ceiling", 1)),
+            self.effect_source_max_stacks,
+        ))
+        return direct_damage * self.effect_source_max_fraction * stack_ceiling
+
+    def _stacked_tick_amounts_compatible(
+            self, previous: float, current: float) -> bool:
+        """Allow a confirmed burn to gain or lose whole stacks between ticks."""
+        if previous <= 0.0 or current <= 0.0:
+            return False
+        ratio = current / previous
+        for prior_stacks in range(1, self.effect_source_max_stacks + 1):
+            for current_stacks in range(1, self.effect_source_max_stacks + 1):
+                expected = current_stacks / prior_stacks
+                if math.isclose(ratio, expected, rel_tol=0.04, abs_tol=0.025):
+                    return True
+        return False
+
+    def _recent_effect_match(
+            self, hit: dict, target_id: Any,
+            attacker_id: Any, event_at: float,
+            channel: str | None = None) -> dict | None:
+        """Return a bounded burn candidate without spending direct-hit evidence."""
+        amount = self._damage(hit)
+        if amount is None:
+            return None
+        explicit = self._hit_declares_dot(hit)
+        current = float(event_at)
+        with self.lock:
+            retained = deque(maxlen=self.effect_sources.maxlen)
+            matches = []
+            for source in self.effect_sources:
+                if float(source["expires_at"]) < current:
+                    continue
+                retained.append(source)
+                if not self._matching_id(source.get("target_id"), target_id):
+                    continue
+                source_channel = source.get("channel")
+                if (channel is not None and source_channel is not None
+                        and channel != source_channel):
+                    continue
+                source_attacker = source.get("attacker_id")
+                if (attacker_id is not None and source_attacker is not None
+                        and not self._matching_id(
+                            attacker_id, source_attacker)):
+                    continue
+                elapsed = current - float(source["last_direct_at"])
+                if elapsed < -self.pending_batch_span:
+                    continue
+                if (0.0 <= elapsed < self.effect_source_min_delay
+                        and not explicit
+                        and not bool(source.get("confirmed"))):
+                    continue
+                if not explicit:
+                    if amount > self._effect_candidate_limit(source):
+                        continue
+                matches.append(source)
+            self.effect_sources = retained
+            if not matches:
+                return None
+
+            source = max(
+                matches, key=lambda value: float(value["last_direct_at"]))
+            samples = list(source.get("tick_samples", ()))
+            duplicate = bool(
+                samples
+                and math.isclose(
+                    float(samples[-1][0]), current, abs_tol=1e-6)
+                and math.isclose(
+                    float(samples[-1][1]), amount,
+                    rel_tol=1e-6, abs_tol=1e-6)
+            )
+            if not duplicate:
+                interval = None
+                periodic = False
+                if samples:
+                    interval = current - float(samples[-1][0])
+                    prior_amount = float(samples[-1][1])
+                    periodic = (
+                        0.45 <= interval <= 1.55
+                        and self._stacked_tick_amounts_compatible(
+                            prior_amount, amount))
+                    if periodic:
+                        source["confirmed"] = True
+                if bool(source.get("confirmed")) and samples and not periodic:
+                    # Once the cadence is known, do not let another low,
+                    # source-free hit inherit the burn label.
+                    return None
+                samples.append((current, float(amount)))
+                source["tick_samples"] = samples[-4:]
+                source["last_tick_at"] = current
+                if bool(source.get("confirmed")):
+                    source["expires_at"] = (
+                        current + self.effect_source_tick_idle_timeout)
+            confirmed = bool(source.get("confirmed")) or explicit
+            return {
+                "weapon": str(source["weapon"]),
+                "dot_capable": True,
+                # Source-free packets cannot prove the first residual belongs
+                # to us.  Promote it only after a stable tick cadence appears.
+                "effect_kind": (
+                    "burn" if confirmed else "possible_burn"),
+                "evidence_kind": "effect",
+            }
 
     def _owned_by_player(self, host: Any, entity_id: Any) -> bool:
         local_id = self._local_player_id(host)
@@ -623,25 +1443,202 @@ class _DamageState:
             return False
         for field in (
                 "owner_id", "player_id", "drone_owner_id", "rc_owner_id",
-                "source_owner_id"):
+                "fighter_owner_id", "source_owner_id"):
             if self._same_id(row.get(field), local_id):
                 return True
         return False
 
     def _combat_direction(
-            self, host: Any, hit: dict, target_id: Any) -> tuple[str, Any] | None:
+            self, host: Any, hit: dict,
+            target_id: Any, event_at: float, *,
+            allow_visual: bool = True,
+            channel: str | None = None,
+            visual_candidates: list[dict] | None = None,
+            ) -> tuple[str, Any, str, dict | None] | None:
         attacker_id = self._attacker_id(hit)
+        weapon = self._weapon_label(hit)
         if self._same_id(target_id, self._local_player_id(host)):
-            if attacker_id is None:
+            if (attacker_id is None
+                    and channel != "DUNGEON_AI_HIT_ENTITY "):
                 attacker_id = hit.get("entity_id")
-            return "received", attacker_id
-        if self._owned_by_player(host, attacker_id):
-            return "dealt", attacker_id
-        if self._recent_local_fire_at(target_id):
-            return "dealt", self._local_player_id(host)
-        if self._recent_owned_weapon_at(host, target_id):
-            return "dealt", self._local_player_id(host)
+            return "received", attacker_id, weapon, None
+
+        if self._known_weapon_label(weapon):
+            attribution = {
+                "weapon": weapon,
+                "dot_capable": self._event_is_dot_capable(
+                    host, hit, weapon, "hit"),
+                "effect_kind": None,
+                "evidence_kind": "hit",
+            }
+            if self._owned_by_player(host, attacker_id):
+                return "dealt", attacker_id, weapon, attribution
+
+        owned_attacker = self._owned_by_player(host, attacker_id)
+        if owned_attacker:
+            if not self._same_id(
+                    attacker_id, self._local_player_id(host)):
+                entity_weapon = self._entity_weapon_label(host, attacker_id)
+                if self._known_weapon_label(entity_weapon):
+                    attribution = {
+                        "weapon": entity_weapon,
+                        "dot_capable": self._event_is_dot_capable(
+                            host, hit, entity_weapon, "entity"),
+                        "effect_kind": None,
+                        "evidence_kind": "entity",
+                    }
+                    return "dealt", attacker_id, entity_weapon, attribution
+            # Real protocol hits get one compact correlation window. Direct
+            # callers without channel context still retain correct totals, but
+            # deliberately show Unknown rather than the selected main weapon.
+            if not allow_visual:
+                if channel is not None:
+                    return None
+                return "dealt", attacker_id, "Unknown", None
+        if not allow_visual:
+            return None
+
+        # Spend direct beam/projectile evidence before considering a residual
+        # effect.  Otherwise a low but valid Patriot hit can be stolen by an
+        # active Blaze context and shift every later turret label.
+        match = self._recent_owned_weapon_at(
+            host, target_id, event_at, hit, visual_candidates)
+        if match is not None:
+            if self._known_weapon_label(weapon):
+                match = dict(match)
+                match["weapon"] = weapon
+                match["dot_capable"] = self._event_is_dot_capable(
+                    host, hit, weapon, "hit")
+            return (
+                "dealt", attacker_id or self._local_player_id(host),
+                str(match["weapon"]), match,
+            )
+
+        effect = self._recent_effect_match(
+            hit, target_id, attacker_id, event_at, channel)
+        if effect is not None:
+            return (
+                "dealt", attacker_id or self._local_player_id(host),
+                str(effect["weapon"]), effect,
+            )
+        if owned_attacker:
+            return "dealt", attacker_id, "Unknown", None
         return None
+
+    def _defer_hit(
+            self, kind: str, hit: dict, event_at: float,
+            channel: str | None = None) -> None:
+        pending = {
+            "kind": kind,
+            "hit": dict(hit),
+            "event_at": float(event_at),
+            "channel": channel,
+        }
+        with self.lock:
+            self.pending_hits.append(pending)
+            while len(self.pending_hits) > self.pending_hit_limit:
+                self.pending_hits.popleft()
+
+    def _resolve_pending_hits(self, host: Any) -> None:
+        now = time.monotonic()
+        # Observe once per frame here, even with no pending hits, so brief
+        # projectiles are retained without rescanning for every candidate.
+        self._observe_owned_projectiles(host)
+        with self.lock:
+            pending = sorted(
+                self.pending_hits,
+                key=lambda item: float(item["event_at"]),
+            )
+            self.pending_hits.clear()
+        retained = []
+        attempted = 0
+        while pending:
+            anchor = pending.pop(0)
+            anchor_hit = anchor["hit"]
+            anchor_target = anchor_hit.get(
+                "target_id", anchor_hit.get("id"))
+            anchor_key = (
+                anchor["kind"], str(anchor_target), anchor.get("channel"))
+            batch = [anchor]
+            remaining = []
+            batch_end = float(anchor["event_at"]) + self.pending_batch_span
+            for item in pending:
+                hit = item["hit"]
+                target_id = hit.get("target_id", hit.get("id"))
+                item_key = (item["kind"], str(target_id), item.get("channel"))
+                if item_key == anchor_key and float(item["event_at"]) <= batch_end:
+                    batch.append(item)
+                else:
+                    remaining.append(item)
+            pending = remaining
+
+            anchor_age = now - float(anchor["event_at"])
+            if anchor_age < self.pending_hit_grace:
+                retained.extend(batch)
+                continue
+
+            available = self.pending_attempt_limit - attempted
+            if available <= 0:
+                retained.extend(batch)
+                continue
+            if len(batch) > available:
+                retained.extend(batch[available:])
+                batch = batch[:available]
+
+            # Assign the most constrained and closest visual evidence first.
+            # Damage is post-mitigation, so even a direct turret hit can be
+            # smaller than a DOT tick and must not lose its beam for that reason.
+            candidate_cache = {}
+            priorities = {}
+            for item in batch:
+                hit = item["hit"]
+                target_id = hit.get("target_id", hit.get("id"))
+                candidates = self._owned_weapon_candidates(
+                    host, target_id, float(item["event_at"]), hit,
+                    refresh_projectiles=False)
+                candidate_cache[id(item)] = candidates
+                priorities[id(item)] = self._pending_direct_evidence_key(
+                    item, candidates)
+            batch.sort(key=lambda item: priorities[id(item)])
+            for item in batch:
+                age = now - float(item["event_at"])
+                if attempted >= self.pending_attempt_limit:
+                    retained.append(item)
+                    continue
+                attempted += 1
+                if item["kind"] == "asteroid":
+                    resolved = self.record_asteroid_hit(
+                        host, item["hit"], allow_defer=False,
+                        event_at=item["event_at"],
+                        channel=item.get("channel"),
+                        visual_candidates=candidate_cache[id(item)])
+                else:
+                    resolved = self.record_ship_hit(
+                        host, item["hit"], allow_defer=False,
+                        event_at=item["event_at"],
+                        channel=item.get("channel"),
+                        visual_candidates=candidate_cache[id(item)])
+                if resolved:
+                    continue
+                if age <= self.pending_hit_timeout:
+                    retained.append(item)
+                    continue
+                self.api.logger.debug(
+                    "DAMAGE_EVENT_UNRESOLVED channel=%s target=%s "
+                    "attacker=%s fields=%s",
+                    item.get("channel"),
+                    item["hit"].get(
+                        "target_id", item["hit"].get("id")),
+                    self._attacker_id(item["hit"]),
+                    sorted(item["hit"]))
+        if retained:
+            with self.lock:
+                combined = sorted(
+                    retained + list(self.pending_hits),
+                    key=lambda item: float(item["event_at"]),
+                )
+                self.pending_hits = deque(
+                    combined[-self.pending_hit_limit:])
 
     def _world_position(self, host: Any, target_id: Any) -> tuple[float, float] | None:
         if self._same_id(target_id, self._local_player_id(host)):
@@ -698,7 +1695,9 @@ class _DamageState:
     def _record_window_hit(
             self, host: Any, target_id: Any, amount: float,
             direction: str, kind: str, attacker_id: Any,
-            damage_type: str) -> None:
+            damage_type: str, weapon: str = "Unknown",
+            event_at: float | None = None,
+            server_damage_type: str | None = None) -> None:
         local_hit = direction == "received"
         target_label = self._target_label(host, target_id, kind)
         attacker_label = (
@@ -708,13 +1707,15 @@ class _DamageState:
         display_label = target_label
         if local_hit and attacker_label and attacker_label != "Player":
             display_label = attacker_label
-        now = time.monotonic()
+        now = time.monotonic() if event_at is None else float(event_at)
         entry = {
             "when": now,
             "direction": direction,
             "target": display_label,
             "attacker": attacker_label,
             "damage_type": damage_type,
+            "server_damage_type": server_damage_type or damage_type,
+            "weapon": weapon,
             "amount": float(amount),
             "blocked": amount == 0.0,
         }
@@ -752,6 +1753,13 @@ class _DamageState:
 
     def clear_window(self) -> None:
         with self.lock:
+            self.pending_hits.clear()
+            self.beam_evidence.clear()
+            self.consumed_beam_evidence.clear()
+            self.weapon_tracks.clear()
+            self.projectile_payload_metadata.clear()
+            self.consumed_weapon_tracks.clear()
+            self.effect_sources.clear()
             self.feed.clear()
             for rows in self.feed_by_direction.values():
                 rows.clear()
@@ -952,6 +1960,9 @@ class _DamageState:
         direction: str = "dealt",
         attacker_id: Any = None,
         damage_type: str = "Unknown",
+        weapon: str = "Unknown",
+        event_at: float | None = None,
+        server_damage_type: str | None = None,
     ) -> None:
         if amount is None:
             if previous is None or remaining is None or remaining >= previous:
@@ -968,7 +1979,8 @@ class _DamageState:
         local_hit = direction == "received"
         self._record_window_hit(
             host, target_id, amount, direction, kind, attacker_id,
-            damage_type)
+            damage_type, weapon, event_at,
+            server_damage_type=server_damage_type)
         self.api.logger.debug(
             "DAMAGE_EVENT_RECORDED target=%s attacker=%s amount=%.3f direction=%s",
             target_id, attacker_id, amount, direction)
@@ -978,27 +1990,47 @@ class _DamageState:
         item = (
             position[0], position[1],
             ("0" if amount == 0.0 else f"-{amount:.0f}"), colour,
-            time.monotonic(), not local_hit,
+            time.monotonic() if event_at is None else float(event_at),
+            not local_hit,
         )
         with self.lock:
             self.items.append(item)
             if len(self.items) > self.limit:
                 del self.items[:-self.limit]
 
-    def record_ship_hit(self, host: Any, hit: Any) -> None:
+    def record_ship_hit(
+            self, host: Any, hit: Any, *, allow_defer: bool = True,
+            event_at: float | None = None,
+            channel: str | None = None,
+            visual_candidates: list[dict] | None = None) -> bool:
         if not isinstance(hit, dict):
-            return
+            return False
         target_id = hit.get("target_id")
         if target_id is None:
-            return
-        combat = self._combat_direction(host, hit, target_id)
+            return False
+        occurred_at = time.monotonic() if event_at is None else float(event_at)
+        combat = self._combat_direction(
+            host, hit, target_id, occurred_at,
+            allow_visual=not allow_defer, channel=channel,
+            visual_candidates=visual_candidates)
         if combat is None:
-            self.api.logger.debug(
-                "DAMAGE_EVENT_IGNORED target=%s attacker=%s fields=%s",
-                target_id, self._attacker_id(hit), sorted(hit))
-            return
-        direction, attacker_id = combat
+            if allow_defer:
+                self._defer_hit("ship", hit, occurred_at, channel)
+            return False
+        direction, attacker_id, weapon, attribution = combat
         amount = self._damage(hit)
+        server_damage_type = self._damage_type_label(hit)
+        damage_type = self._report_damage_type(
+            server_damage_type, attribution)
+        if isinstance(attribution, dict):
+            if attribution.get("effect_kind") == "burn":
+                weapon = f"{weapon} (Burn)"
+            elif attribution.get("effect_kind") == "possible_burn":
+                weapon = f"{weapon} (Possible Burn)"
+            elif direction == "dealt":
+                self._remember_effect_source(
+                    target_id, attacker_id, attribution, amount,
+                    server_damage_type, occurred_at, channel)
         raw_remaining = hit.get("shields_remaining", hit.get("shields"))
         try:
             remaining = (
@@ -1011,9 +2043,9 @@ class _DamageState:
             remaining = 0.0
         confirmed_zero = remaining == 0.0
         if "damage" in hit and amount is None and not confirmed_zero:
-            return
+            return True
         if amount is None and remaining is None:
-            return
+            return True
         key = "ship:" + str(target_id)
         current = self._number(self._entity(host, target_id), "shields")
         with self.lock:
@@ -1031,22 +2063,44 @@ class _DamageState:
             self._world_position(host, target_id), amount=amount,
             show_zero=confirmed_zero, kind="ship", direction=direction,
             attacker_id=attacker_id,
-            damage_type=self._damage_type_label(hit))
+            damage_type=damage_type, weapon=weapon,
+            event_at=occurred_at,
+            server_damage_type=server_damage_type)
+        return True
 
-    def record_asteroid_hit(self, host: Any, hit: Any) -> None:
+    def record_asteroid_hit(
+            self, host: Any, hit: Any, *, allow_defer: bool = True,
+            event_at: float | None = None,
+            channel: str | None = None,
+            visual_candidates: list[dict] | None = None) -> bool:
         if not isinstance(hit, dict):
-            return
+            return False
         target_id = hit.get("id")
         if target_id is None:
-            return
-        combat = self._combat_direction(host, hit, target_id)
+            return False
+        occurred_at = time.monotonic() if event_at is None else float(event_at)
+        combat = self._combat_direction(
+            host, hit, target_id, occurred_at,
+            allow_visual=not allow_defer, channel=channel,
+            visual_candidates=visual_candidates)
         if combat is None:
-            self.api.logger.debug(
-                "DAMAGE_EVENT_IGNORED target=%s attacker=%s fields=%s",
-                target_id, self._attacker_id(hit), sorted(hit))
-            return
-        direction, attacker_id = combat
+            if allow_defer:
+                self._defer_hit("asteroid", hit, occurred_at, channel)
+            return False
+        direction, attacker_id, weapon, attribution = combat
         amount = self._damage(hit)
+        server_damage_type = self._damage_type_label(hit)
+        damage_type = self._report_damage_type(
+            server_damage_type, attribution)
+        if isinstance(attribution, dict):
+            if attribution.get("effect_kind") == "burn":
+                weapon = f"{weapon} (Burn)"
+            elif attribution.get("effect_kind") == "possible_burn":
+                weapon = f"{weapon} (Possible Burn)"
+            elif direction == "dealt":
+                self._remember_effect_source(
+                    target_id, attacker_id, attribution, amount,
+                    server_damage_type, occurred_at, channel)
         try:
             raw_remaining = hit.get("health_remaining")
             remaining = (
@@ -1059,9 +2113,9 @@ class _DamageState:
             remaining = 0.0
         confirmed_zero = remaining == 0.0
         if "damage" in hit and amount is None and not confirmed_zero:
-            return
+            return True
         if amount is None and remaining is None:
-            return
+            return True
         key = "asteroid:" + str(target_id)
         current = self._number(self._asteroid(host, target_id), "health")
         with self.lock:
@@ -1079,7 +2133,10 @@ class _DamageState:
             self._asteroid_position(host, target_id), amount=amount,
             show_zero=confirmed_zero, kind="asteroid", direction=direction,
             attacker_id=attacker_id,
-            damage_type=self._damage_type_label(hit))
+            damage_type=damage_type, weapon=weapon,
+            event_at=occurred_at,
+            server_damage_type=server_damage_type)
+        return True
 
     def snapshot(self, host: Any) -> None:
         snapshot = {}
@@ -1107,9 +2164,9 @@ class _DamageState:
                 # becomes the next valid baseline.
                 if previous is None or value > previous:
                     self.pools[key] = value
-        self._observe_owned_projectiles(host)
         self._observe_local_fire(host)
         self._observe_energy(host)
+        self._resolve_pending_hits(host)
 
     def _draw_floaters(self, host: Any, surface: Any) -> None:
         now = time.monotonic()
@@ -1481,11 +2538,25 @@ class _DamageState:
                 "dealt": "DAMAGE DEALT HISTORY",
                 "received": "DAMAGE RECEIVED HISTORY",
             }[self.active_tab]
+            weapon_x = min(177, max(148, width // 3))
+            target_x = max(
+                weapon_x + 74,
+                min(weapon_x + 128, width - 78))
             self._blit_text(
                 panel, small_font, heading, (140, 154, 168), 10, 156)
+            column_colour = (116, 132, 148)
+            self._blit_text(panel, small_font, "DIR", column_colour, 10, 171)
+            self._blit_text(
+                panel, small_font, "DAMAGE", column_colour, 47, 171)
+            self._blit_text(
+                panel, small_font, "TYPE", column_colour, 106, 171)
+            self._blit_text(
+                panel, small_font, "WEAPON", column_colour, weapon_x, 171)
+            self._blit_text(
+                panel, small_font, "TARGET", column_colour, target_x, 171)
             pygame.draw.line(
-                panel, (35, 47, 59), (10, 173), (width - 10, 173), 1)
-            row_start = 180
+                panel, (35, 47, 59), (10, 187), (width - 10, 187), 1)
+            row_start = 193
             feed_height = max(0, height - 25 - row_start)
             row_limit = max(0, feed_height // 21 + 1)
             self.feed_row_capacity = row_limit
@@ -1529,9 +2600,13 @@ class _DamageState:
                 damage_type = str(entry.get("damage_type", "Unknown"))
                 type_colour = _DAMAGE_TYPE_COLOURS.get(
                     damage_type, _DAMAGE_TYPE_COLOURS["Unknown"])
+                weapon = str(entry.get("weapon", "Unknown"))
                 target = str(entry["target"])
-                target_x = 177
                 target_right_margin = 22 if self.scroll_max > 0 else 10
+                weapon_limit = max(
+                    8, min(22, (target_x - weapon_x - 12) // 7))
+                if len(weapon) > weapon_limit:
+                    weapon = weapon[:max(5, weapon_limit - 3)] + "..."
                 target_limit = max(
                     8, (width - target_x - target_right_margin) // 7)
                 if len(target) > target_limit:
@@ -1541,6 +2616,8 @@ class _DamageState:
                     panel, body_font, amount, (230, 234, 238), 47, row_y)
                 self._blit_text(
                     panel, body_font, damage_type, type_colour, 106, row_y)
+                self._blit_text(
+                    panel, body_font, weapon, (190, 203, 216), weapon_x, row_y)
                 self._blit_text(
                     panel, body_font, target, (158, 170, 182), target_x, row_y)
 
@@ -1679,6 +2756,143 @@ class _DamageState:
         }
         return event_type in mouse_events and self._inside(self.window_rect, point)
 
+    def _current_protocol_channel(self) -> str | None:
+        stack = getattr(self.protocol_context, "stack", None)
+        return stack[-1] if stack else None
+
+    @staticmethod
+    def _diagnostic_payload_shape(
+            payload: str) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+        """Describe JSON structure without recording any packet values."""
+        if not payload.strip():
+            return "empty", (), ()
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "text", (), ()
+        if not isinstance(data, dict):
+            return type(data).__name__, (), ()
+        fields = tuple(sorted(str(key) for key in data))
+        nested = []
+        for key in fields:
+            value = data.get(key)
+            if isinstance(value, dict):
+                child_fields = ",".join(sorted(str(child) for child in value))
+                nested.append(f"{key}.{{{child_fields}}}")
+            elif isinstance(value, list) and value:
+                first = value[0]
+                if isinstance(first, dict):
+                    child_fields = ",".join(
+                        sorted(str(child) for child in first))
+                    nested.append(f"{key}[].{{{child_fields}}}")
+                elif isinstance(first, (list, tuple)):
+                    nested.append(f"{key}[{len(first)}]")
+        return "object", fields, tuple(nested)
+
+    @staticmethod
+    def _protocol_token_is_known(app: Any, token: str) -> bool:
+        index = getattr(app, "_kw_index", None)
+        if isinstance(index, dict):
+            return token in index
+        handlers = getattr(app, "_prefix_handlers", None)
+        return (isinstance(handlers, dict)
+                and any(
+                    str(prefix).partition(" ")[0] == token
+                    for prefix in handlers))
+
+    def _capture_protocol_line(self, app: Any, line: Any) -> None:
+        """Log each relevant packet shape once for the DOT data audit."""
+        text = str(line)
+        token, separator, payload = text.partition(" ")
+        token = token.strip().upper()
+        if not token:
+            return
+        known = self._protocol_token_is_known(app, token)
+        interesting = (
+            token in _PROTOCOL_DIAGNOSTIC_TOKENS
+            or (token.startswith("DUNGEON_") and not known)
+            or any(keyword in token for keyword in _PROTOCOL_DIAGNOSTIC_KEYWORDS)
+        )
+        if not interesting:
+            return
+        payload_type, fields, nested = self._diagnostic_payload_shape(
+            payload if separator else "")
+        signature = (token, known, payload_type, fields, nested)
+        with self.lock:
+            if signature in self.protocol_packet_shapes:
+                return
+            self.protocol_packet_shapes.add(signature)
+        self.api.logger.debug(
+            "DAMAGE_PROTOCOL_CAPTURE token=%s known=%s payload=%s fields=%s nested=%s",
+            token, known, payload_type, fields, nested)
+
+    def _install_protocol_route_diagnostic(self, host: Any) -> None:
+        """Observe inbound packet shapes without altering their handling."""
+        if self.protocol_route_entry is not None:
+            return
+        send_fn = getattr(host, "_send_fn", None)
+        app = getattr(send_fn, "__self__", None)
+        original = getattr(app, "_route_game_line", None)
+        if not callable(original):
+            self.api.logger.debug(
+                "DAMAGE_PROTOCOL_CAPTURE_UNAVAILABLE route=%s",
+                type(original).__name__)
+            return
+        instance_dict = getattr(app, "__dict__", {})
+        had_instance_route = "_route_game_line" in instance_dict
+        original_instance_route = instance_dict.get("_route_game_line")
+        state = self
+
+        def route_wrapper(instance, line, arrival_time=None):
+            try:
+                state._capture_protocol_line(instance, line)
+            except Exception:
+                state.api.logger.exception(
+                    "damage-number protocol capture failed")
+            return original(line, arrival_time)
+
+        wrapper = types.MethodType(route_wrapper, app)
+        setattr(app, "_route_game_line", wrapper)
+        self.protocol_route_entry = (
+            app, original, wrapper,
+            had_instance_route, original_instance_route,
+        )
+
+    def _install_protocol_context_hooks(self, host: Any) -> None:
+        send_fn = getattr(host, "_send_fn", None)
+        app = getattr(send_fn, "__self__", None)
+        handlers = getattr(app, "_prefix_handlers", None)
+        if not isinstance(handlers, dict):
+            self.api.logger.debug(
+                "DAMAGE_PROTOCOL_CONTEXT_UNAVAILABLE handlers=%s",
+                type(handlers).__name__)
+            return
+        state = self
+        for prefix in (
+                "SPACE_HIT ", "DUNGEON_AI_HIT ",
+                "DUNGEON_AI_HIT_ENTITY "):
+            original = handlers.get(prefix)
+            if not callable(original):
+                continue
+
+            def make_handler_wrapper(original_handler, channel_name):
+                def handler_wrapper(*args, **kwargs):
+                    stack = getattr(state.protocol_context, "stack", None)
+                    if stack is None:
+                        stack = []
+                        state.protocol_context.stack = stack
+                    stack.append(channel_name)
+                    try:
+                        return original_handler(*args, **kwargs)
+                    finally:
+                        stack.pop()
+                return handler_wrapper
+
+            wrapper = make_handler_wrapper(original, prefix)
+            handlers[prefix] = wrapper
+            self.protocol_handler_entries[prefix] = (
+                handlers, original, wrapper)
+
     def install(self, host: Any, pygame: Any) -> None:
         if self.host is not None:
             if self.host is host:
@@ -1694,7 +2908,9 @@ class _DamageState:
         def hit_wrapper(instance, hit):
             if instance is state.host:
                 try:
-                    state.record_ship_hit(instance, hit)
+                    state.record_ship_hit(
+                        instance, hit,
+                        channel=state._current_protocol_channel())
                 except Exception:
                     state.api.logger.exception("damage-number ship hit failed")
             return original_hit(instance, hit)
@@ -1702,7 +2918,9 @@ class _DamageState:
         def asteroid_wrapper(instance, hit):
             if instance is state.host:
                 try:
-                    state.record_asteroid_hit(instance, hit)
+                    state.record_asteroid_hit(
+                        instance, hit,
+                        channel=state._current_protocol_channel())
                 except Exception:
                     state.api.logger.exception("damage-number asteroid hit failed")
             return original_asteroid(instance, hit)
@@ -1715,23 +2933,110 @@ class _DamageState:
         self.asteroid_wrapper = asteroid_wrapper
         host_type.register_hit = hit_wrapper
         host_type.register_asteroid_hit = asteroid_wrapper
+        self._install_protocol_context_hooks(host)
+        self._install_protocol_route_diagnostic(host)
+
+        for method_name, source in (
+                ("add_beam", "_beams"),
+                ("add_turret_beam", "_turret_beams"),
+                ("add_station_beam", "_station_beams")):
+            original = getattr(host_type, method_name, None)
+            if not callable(original):
+                continue
+
+            def make_beam_wrapper(original_method, beam_source):
+                def beam_wrapper(instance, beam, *args, **kwargs):
+                    result = original_method(instance, beam, *args, **kwargs)
+                    if instance is state.host:
+                        try:
+                            state._remember_beam_event(beam_source, beam)
+                        except Exception:
+                            state.api.logger.exception(
+                                "damage-number beam capture failed")
+                    return result
+                return beam_wrapper
+
+            wrapper = make_beam_wrapper(original, source)
+            self.original_event_methods[method_name] = original
+            self.event_wrappers[method_name] = wrapper
+            setattr(host_type, method_name, wrapper)
+
+        for method_name, stream_name in (
+                ("set_projectiles", "player"),
+                ("set_ai_projectiles", "arena")):
+            original = getattr(host_type, method_name, None)
+            if not callable(original):
+                continue
+
+            def make_projectile_wrapper(original_method, projectile_stream):
+                def projectile_wrapper(instance, payload, *args, **kwargs):
+                    if instance is state.host:
+                        try:
+                            state._remember_projectile_payload(
+                                payload, projectile_stream)
+                        except Exception:
+                            state.api.logger.exception(
+                                "damage-number projectile metadata capture failed")
+                    result = original_method(
+                        instance, payload, *args, **kwargs)
+                    if instance is state.host:
+                        try:
+                            state._observe_owned_projectiles(instance)
+                        except Exception:
+                            state.api.logger.exception(
+                                "damage-number projectile capture failed")
+                    return result
+                return projectile_wrapper
+
+            wrapper = make_projectile_wrapper(original, stream_name)
+            self.original_event_methods[method_name] = original
+            self.event_wrappers[method_name] = wrapper
+            setattr(host_type, method_name, wrapper)
         self.snapshot(host)
 
     def uninstall(self) -> None:
         host = self.host
+        if self.protocol_route_entry is not None:
+            app, _original, wrapper, had_instance_route, original_instance_route = (
+                self.protocol_route_entry)
+            instance_dict = getattr(app, "__dict__", {})
+            if instance_dict.get("_route_game_line") is wrapper:
+                if had_instance_route:
+                    setattr(app, "_route_game_line", original_instance_route)
+                else:
+                    delattr(app, "_route_game_line")
+            self.protocol_route_entry = None
+        for _prefix, entry in self.protocol_handler_entries.items():
+            handlers, original, wrapper = entry
+            if handlers.get(_prefix) is wrapper:
+                handlers[_prefix] = original
+        self.protocol_handler_entries.clear()
         if host is not None:
             host_type = type(host)
             if getattr(host_type, "register_hit", None) is self.hit_wrapper:
                 host_type.register_hit = self.original_hit
             if getattr(host_type, "register_asteroid_hit", None) is self.asteroid_wrapper:
                 host_type.register_asteroid_hit = self.original_asteroid_hit
+            for method_name, wrapper in self.event_wrappers.items():
+                if getattr(host_type, method_name, None) is wrapper:
+                    setattr(
+                        host_type, method_name,
+                        self.original_event_methods[method_name])
         with self.lock:
             self.items.clear()
             self.pools.clear()
             self.feed.clear()
             self.fire_intents.clear()
             self.weapon_tracks.clear()
-            self.weapon_target_intents.clear()
+            self.projectile_payload_metadata.clear()
+            self.consumed_weapon_tracks.clear()
+            self.pending_hits.clear()
+            self.beam_evidence.clear()
+            self.consumed_beam_evidence.clear()
+            self.effect_sources.clear()
+            self.protocol_packet_shapes.clear()
+        self.original_event_methods.clear()
+        self.event_wrappers.clear()
         self.host = None
         self.pygame = None
         self.window_rect = None
