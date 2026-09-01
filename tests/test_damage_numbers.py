@@ -254,7 +254,7 @@ class DamageNumberTests(unittest.TestCase):
 
         stats = self.state.combat_stats_snapshot(now=104.0)
 
-        self.assertEqual("active", stats["status"])
+        self.assertEqual("running", stats["status"])
         self.assertEqual(3.0, stats["duration"])
         self.assertAlmostEqual(50.0, stats["dealt"]["dps"])
         self.assertAlmostEqual(75.0, stats["dealt"]["average"])
@@ -372,7 +372,7 @@ class DamageNumberTests(unittest.TestCase):
         self.assertAlmostEqual(30.0, stats["energy_used"])
         self.assertAlmostEqual(10.0, stats["dpe"])
 
-    def test_rolling_dps_uses_only_the_last_ten_seconds(self):
+    def test_session_dps_keeps_a_running_total_without_a_rolling_window(self):
         with patch.object(self.module.time, "monotonic", return_value=0.0):
             self.state._record_window_hit(
                 self.host, 7, 100.0, "dealt", "ship", 99, "Kinetic")
@@ -383,25 +383,35 @@ class DamageNumberTests(unittest.TestCase):
         stats = self.state.combat_stats_snapshot(now=12.0)
 
         self.assertAlmostEqual(30.0, stats["dealt"]["dps"])
-        self.assertAlmostEqual(5.0, stats["dealt"]["rolling_dps"])
+        self.assertAlmostEqual(150.0, stats["dealt"]["total"])
+        with patch.object(self.module.time, "monotonic", return_value=20.0):
+            self.state._record_window_hit(
+                self.host, 7, 50.0, "dealt", "ship", 99, "Thermal")
 
-    def test_quiet_period_finishes_then_next_hit_starts_new_encounter(self):
+        stats = self.state.combat_stats_snapshot(now=21.0)
+
+        self.assertEqual("running", stats["status"])
+        self.assertAlmostEqual(200.0, stats["dealt"]["total"])
+        self.assertAlmostEqual(10.0, stats["dealt"]["dps"])
+
+    def test_quiet_period_does_not_start_a_new_session(self):
         with patch.object(self.module.time, "monotonic", return_value=0.0):
             self.state._record_window_hit(
                 self.host, 7, 100.0, "dealt", "ship", 99, "Kinetic")
 
-        finished = self.state.combat_stats_snapshot(now=11.0)
+        after_gap = self.state.combat_stats_snapshot(now=11.0)
 
-        self.assertEqual("complete", finished["status"])
-        self.assertEqual(100.0, finished["dealt"]["total"])
+        self.assertEqual("running", after_gap["status"])
+        self.assertEqual(100.0, after_gap["dealt"]["total"])
         with patch.object(self.module.time, "monotonic", return_value=12.0):
             self.state._record_window_hit(
                 self.host, 7, 40.0, "dealt", "ship", 99, "Thermal")
-        next_encounter = self.state.combat_stats_snapshot(now=13.0)
+        session_stats = self.state.combat_stats_snapshot(now=13.0)
         session = self.state.window_totals_snapshot()
 
-        self.assertEqual("active", next_encounter["status"])
-        self.assertEqual(40.0, next_encounter["dealt"]["total"])
+        self.assertEqual("running", session_stats["status"])
+        self.assertEqual(140.0, session_stats["dealt"]["total"])
+        self.assertAlmostEqual(140.0 / 12.0, session_stats["dealt"]["dps"])
         self.assertEqual(140.0, session["dealt_total"])
 
     def test_clear_window_resets_encounter_statistics(self):
@@ -1103,7 +1113,7 @@ class DamageNumberTests(unittest.TestCase):
         self.assertEqual(6, self.state.effect_sources[0]["stack_ceiling"])
 
         stats = self.state.combat_stats_snapshot(now=113.0)
-        self.assertEqual("active", stats["status"])
+        self.assertEqual("running", stats["status"])
         self.assertEqual(13, stats["dealt"]["hits"])
         self.assertAlmostEqual(13 * 540.0, stats["dealt"]["total"])
 

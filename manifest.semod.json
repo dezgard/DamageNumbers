@@ -15,7 +15,7 @@
   },
   "conflicts": [],
   "dependencies": [],
-  "description": "Shows floating damage numbers and a personal combat report with encounter stats.",
+  "description": "Shows floating damage numbers and a personal combat report with running session stats.",
   "entrypoint": "star_empire_damage_numbers:register",
   "files": [
     "mod/star_empire_damage_numbers/README.md",
@@ -37,5 +37,5 @@
     "repository": "dezgard/DamageNumbers",
     "type": "github-release"
   },
-  "version": "0.5"
+  "version": "0.6"
 }
