@@ -84,12 +84,8 @@ class _DamageState:
             "dealt": self._empty_direction_stats(),
             "received": self._empty_direction_stats(),
         }
-        self.rolling_hits = deque()
-        self.rolling_totals = {"dealt": 0.0, "received": 0.0}
         self.encounter_started_at = None
         self.encounter_last_hit_at = None
-        self.encounter_quiet_seconds = 10.0
-        self.rolling_seconds = 10.0
         self.encounter_energy_used = 0.0
         self.energy_previous = None
         self.energy_previous_at = None
@@ -167,8 +163,6 @@ class _DamageState:
             "dealt": self._empty_direction_stats(),
             "received": self._empty_direction_stats(),
         }
-        self.rolling_hits.clear()
-        self.rolling_totals = {"dealt": 0.0, "received": 0.0}
         self.encounter_started_at = started_at
         self.encounter_last_hit_at = started_at
         if started_at is None:
@@ -393,10 +387,9 @@ class _DamageState:
                    and self.energy_recent_spend[0][0] < cutoff):
                 self.energy_recent_spend.popleft()
             self.energy_recent_spend.append((observed_at, spent))
-            last_hit = self.encounter_last_hit_at
-            if (last_hit is not None
-                    and observed_at >= last_hit
-                    and observed_at - last_hit <= self.encounter_quiet_seconds):
+            started_at = self.encounter_started_at
+            if (started_at is not None
+                    and observed_at >= float(started_at)):
                 self.encounter_energy_used += spent
 
     def _local_player_id(self, host: Any) -> Any:
@@ -1720,12 +1713,11 @@ class _DamageState:
             "blocked": amount == 0.0,
         }
         with self.lock:
-            if (self.encounter_last_hit_at is None
-                    or now < self.encounter_last_hit_at
-                    or now - self.encounter_last_hit_at
-                    > self.encounter_quiet_seconds):
+            if self.encounter_started_at is None:
                 self._reset_encounter_unlocked(now)
-            self.encounter_last_hit_at = now
+            if (self.encounter_last_hit_at is None
+                    or now >= self.encounter_last_hit_at):
+                self.encounter_last_hit_at = now
             encounter = self.encounter_stats[direction]
             encounter["total"] += amount
             encounter["hits"] += 1
@@ -1737,8 +1729,6 @@ class _DamageState:
                 bucket = totals.setdefault(key, {"amount": 0.0, "hits": 0})
                 bucket["amount"] += amount
                 bucket["hits"] += 1
-            self.rolling_hits.append((now, direction, amount))
-            self.rolling_totals[direction] += amount
             if local_hit:
                 self.received_total += amount
                 self.received_hits += 1
@@ -1812,9 +1802,7 @@ class _DamageState:
             }
 
     @staticmethod
-    def _direction_stats(
-            source: dict, duration: float, rolling_total: float,
-            rolling_duration: float) -> dict:
+    def _direction_stats(source: dict, duration: float) -> dict:
         total = float(source["total"])
         hits = int(source["hits"])
         def ranked(source: dict[str, dict[str, float | int]]) -> tuple[dict, ...]:
@@ -1837,59 +1825,36 @@ class _DamageState:
             "average": total / hits if hits else 0.0,
             "maximum": float(source["maximum"]),
             "dps": total / max(1.0, duration) if hits else 0.0,
-            "rolling_dps": (
-                rolling_total / max(1.0, rolling_duration)
-                if hits else 0.0
-            ),
             "hits_per_second": hits / max(1.0, duration) if hits else 0.0,
             "types": ranked(source["types"]),
             "targets": ranked(source["targets"]),
         }
 
     def combat_stats_snapshot(self, now: float | None = None) -> dict:
-        current = time.monotonic() if now is None else float(now)
         with self.lock:
             started = self.encounter_started_at
             last = self.encounter_last_hit_at
-            quiet = self.encounter_quiet_seconds
-            rolling = self.rolling_seconds
             if started is None or last is None:
                 status = "idle"
                 duration = 0.0
-                rolling_duration = 0.0
             else:
-                current = max(current, float(last))
-                active = current - float(last) <= quiet
-                status = "active" if active else "complete"
+                status = "running"
                 duration = max(0.0, float(last) - float(started))
-                rolling_duration = min(
-                    rolling, max(0.0, current - float(started)))
-
-            cutoff = current - rolling
-            while (self.rolling_hits
-                   and float(self.rolling_hits[0][0]) < cutoff):
-                _, direction, amount = self.rolling_hits.popleft()
-                self.rolling_totals[direction] = max(
-                    0.0, self.rolling_totals[direction] - amount)
             energy_used = max(0.0, float(self.encounter_energy_used))
             dealt_total = float(self.encounter_stats["dealt"]["total"])
             dpe_available = energy_used > 1e-6
             return {
                 "status": status,
                 "duration": duration,
-                "quiet_seconds": quiet,
-                "rolling_seconds": rolling,
                 "dealt": self._direction_stats(
-                    self.encounter_stats["dealt"], duration,
-                    self.rolling_totals["dealt"], rolling_duration),
+                    self.encounter_stats["dealt"], duration),
                 "received": self._direction_stats(
-                    self.encounter_stats["received"], duration,
-                    self.rolling_totals["received"], rolling_duration),
+                    self.encounter_stats["received"], duration),
                 "energy_used": energy_used,
                 "dpe": dealt_total / energy_used if dpe_available else 0.0,
                 "dpe_available": dpe_available,
                 "dpe_reason": (
-                    "" if dpe_available else "No encounter energy use recorded"),
+                    "" if dpe_available else "No session energy use recorded"),
             }
 
     def feed_view(self, row_limit: int) -> dict:
@@ -2324,12 +2289,13 @@ class _DamageState:
             stats: dict) -> None:
         status = str(stats["status"]).upper()
         status_colour = {
+            "RUNNING": (104, 222, 137),
             "ACTIVE": (104, 222, 137),
             "COMPLETE": (232, 190, 85),
             "IDLE": (127, 141, 154),
         }.get(status, (127, 141, 154))
         self._blit_text(
-            panel, small_font, "ENCOUNTER", (140, 154, 168), 10, 73)
+            panel, small_font, "SESSION", (140, 154, 168), 10, 73)
         self._blit_text(panel, small_font, status, status_colour, 75, 73)
         self._blit_text(
             panel, small_font, self._format_duration(stats["duration"]),
@@ -2350,7 +2316,7 @@ class _DamageState:
                 (238, 241, 244), card_x + 7, 111)
             self._blit_text(
                 panel, small_font,
-                f"10S {self._format_metric(values['rolling_dps'])}",
+                f"TOTAL {self._format_metric(values['total'])}",
                 (166, 180, 193), card_x + 7, 135)
             self._blit_text(
                 panel, small_font,

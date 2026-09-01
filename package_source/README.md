@@ -9,7 +9,7 @@ and receive.
 - Floating damage numbers over the target that was hit.
 - A report covering your combat only, without nearby fights mixed in.
 - Separate **All**, **Dealt**, and **Received** tabs with totals and hit counts.
-- A **Stats** tab with encounter DPS, incoming DPS, rolling 10-second rates,
+- A **Stats** tab with running session DPS and incoming DPS, total damage,
   average and largest hits, hit rate, blocks, damage types, top targets, damage
   per energy and total energy used.
 - Target names and full damage types when Star Empire provides them.
@@ -42,7 +42,7 @@ packet. When a direct fire-cannon hit is observed, matching repeat ticks can
 be labelled `Possible Burn` and then `Burn`. Ambiguous source-free hits remain
 `Unknown` rather than being forced onto a weapon.
 
-Damage per energy uses the ship's live energy use during the encounter and
+Damage per energy uses the ship's live energy use during the current session and
 accounts for energy regenerated between updates. It is a ship-wide efficiency
 figure, not a per-weapon breakdown.
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6
+
+- Replaced the 10-second Stats reset with a running combat session.
+- DPS and DTPS now use the full session total and only reset when you press
+  **CLEAR**.
+- The Stats tab now shows total damage for the current session.
+
 ## v0.5
 
 - Added compatibility with Star Empire 0.4.95.
