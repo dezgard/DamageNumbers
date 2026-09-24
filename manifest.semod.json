@@ -9,7 +9,9 @@
       "0.4.73",
       "0.4.91",
       "0.4.94",
-      "0.4.95"
+      "0.4.95",
+      "0.5.14",
+      "0.5.25"
     ],
     "mode": "game-version"
   },
@@ -37,5 +39,5 @@
     "repository": "dezgard/DamageNumbers",
     "type": "github-release"
   },
-  "version": "0.6"
+  "version": "0.8"
 }

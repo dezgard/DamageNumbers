@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.8 (pre-alpha)
+
+- Added compatibility for the tested Star Empire 0.5.25 client.
+- The package registered with the 0.5.25 loader; post-login combat still
+  needs a tester.
+
+## v0.7
+
+- Added compatibility for Star Empire 0.5.14.
+
 ## v0.6
 
 - Replaced the 10-second Stats reset with a running combat session.
